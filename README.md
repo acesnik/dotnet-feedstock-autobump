@@ -318,6 +318,42 @@ out per line. It resolves refs across any remote name, not just `origin`.
 Standard library only, deliberately — everything runs in a bare container with no
 `pip install` step.
 
+## Tests
+
+```bash
+pytest            # 54 offline tests, ~2.5s
+pytest -m live    # 9 tests against real upstream endpoints
+```
+
+The offline suite monkeypatches `fetch_json`, `repodata_size` and git, and an
+autouse fixture makes any real request in a default-run test **fail** rather than
+silently succeed — so "offline" is enforced, not aspirational.
+
+Most of these assertions started life as throwaway one-liners while building
+this, and each one corresponds to a bug that actually existed or a decision that
+was easy to get wrong:
+
+- `rewrite_meta` puts each hash on **its own selector**. Six sha256 lines are
+  structurally identical apart from a trailing `# [linux and aarch64]` comment, so
+  an anchoring bug would ship the wrong platform's hash — a package that installs
+  and then fails on exactly one architecture.
+- The **negative** cases: EOL lines are never bumped, previews are refused,
+  a frozen subdir is skipped, an outgoing line's bump is deferred during a
+  transition. All of these are "do nothing" behaviours, where a regression looks
+  identical to success.
+- The audit reads `PLATFORMS` from the updater rather than config, which the suite
+  asserts — that drift is the exact thing the audit exists to detect.
+
+The **live** suite exists because the offline one cannot catch the likeliest real
+breakage: Microsoft or anaconda.org changing a payload shape. Every offline test
+asserts against fixtures, so all of them would keep passing while production
+broke. The live tests check only the fields the scripts read — including that SDK
+hashes are still 128-char SHA-512 (if that ever becomes SHA-256, the re-hashing
+step can go), that every RID in `PLATFORMS` is still published, and that the
+recipe's `dotnetcli.azureedge.net` host still serves artifacts even though the
+metadata points at a different hostname. They run weekly on a schedule rather than
+per-commit, since a failure there is upstream's change, not yours.
+
 ## Known gaps
 
 - **`--write` does not rerender.** It can't; `conda-smithy` isn't a dependency

@@ -1,0 +1,40 @@
+# Offline suite on every push and PR. The live suite is separate and scheduled,
+# because it asserts an upstream contract rather than our own code -- a failure
+# there means Microsoft or anaconda.org changed a payload shape, which should not
+# block a commit that had nothing to do with it.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, an hour before the release check, so schema drift surfaces first.
+    - cron: "41 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pytest
+      - run: pytest -q
+
+  live:
+    # Only on a schedule or by hand: these make real network calls.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pytest
+      - run: pytest -m live -q
