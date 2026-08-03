@@ -38,8 +38,8 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      bump_channel: ${{ steps.plan.outputs.bump_channel }}
-      latest_sdk: ${{ steps.plan.outputs.latest_sdk }}
+      bumps: ${{ steps.plan.outputs.bumps }}
+      bump_count: ${{ steps.plan.outputs.bump_count }}
       issue_count: ${{ steps.plan.outputs.issue_count }}
       issue_repo: ${{ steps.plan.outputs.issue_repo }}
     steps:
@@ -47,12 +47,16 @@ jobs:
 
       # No token here on purpose: the feedstock is public, and planning only
       # reads. The token is needed solely by the bump job, which pushes.
-      - name: Check out the feedstock (read-only)
+      #
+      # fetch-depth 0 and no `ref`: every tracked line lives on its own branch
+      # (main for 10.0, v8 for 8.0), and plan.py reads each one with
+      # `git show <ref>:recipe/meta.yaml` rather than checking anything out.
+      - name: Check out the feedstock (read-only, all branches)
         uses: actions/checkout@v7
         with:
           repository: ${{ env.UPSTREAM }}
           path: feedstock
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Plan
         id: plan
@@ -61,9 +65,12 @@ jobs:
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           p = json.load(open("plan.json"))
-          b = p.get("bump") or {}
-          print(f"bump_channel={b.get('channel','')}")
-          print(f"latest_sdk={b.get('latest_sdk','')}")
+          bumps = p.get("bumps", [])
+          # Compact single-line JSON: this feeds `fromJson` into the bump job's
+          # matrix, so each stale line gets an independent PR against its own
+          # branch and concurrent bumps cannot conflict.
+          print("bumps=" + json.dumps(bumps, separators=(",", ":")))
+          print(f"bump_count={len(bumps)}")
           print(f"issue_count={len(p.get('issues', []))}")
           print(f"issue_repo={p.get('issue_repo','')}")
           PY
@@ -73,10 +80,13 @@ jobs:
           import json
           p = json.load(open("plan.json"))
           print(f"## Plan\n")
-          print(f"- tracking **{p['track']}** (policy `{p['policy']}`)")
-          print(f"- recipe at `{p['recipe']['sdk_version']}` / runtime `{p['recipe']['runtime_version']}`")
-          b = p.get("bump")
-          print(f"- bump: **{b['current_sdk']} -> {b['latest_sdk']}**" if b else "- bump: none, recipe is current")
+          print(f"Policy `{p['policy']}`.\n")
+          print("| line | branch | recipe | latest | phase | |")
+          print("|---|---|---|---|---|---|")
+          for l in p["lines"]:
+              mark = "**STALE**" if l["stale"] else "current"
+              print(f"| {l['channel']} | `{l['branch']}` | `{l['current_sdk']}` "
+                    f"| `{l['latest_sdk']}` | {l['support_phase']} | {mark} |")
           print(f"\n### Architectures\n")
           print(f"- packaged: `{'`, `'.join(p['rids']['packaged'])}`")
           print(f"- offered but not packaged:\n")
@@ -96,8 +106,15 @@ jobs:
 
   bump:
     needs: plan
-    if: needs.plan.outputs.bump_channel != '' && inputs.dry_run != true
+    if: needs.plan.outputs.bump_count != '0' && inputs.dry_run != true
     runs-on: ubuntu-latest
+    strategy:
+      # One job per stale line, each targeting its own branch. Independent, so a
+      # failure on 8.0 does not block 10.0, and their PRs never conflict.
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include: ${{ fromJson(needs.plan.outputs.bumps) }}
     steps:
       - uses: actions/checkout@v7
 
@@ -109,12 +126,17 @@ jobs:
           token: ${{ secrets.FEEDSTOCK_TOKEN }}
           fetch-depth: 0
 
-      - name: Base on upstream, not on a possibly-stale fork
+      - name: Base on upstream ${{ matrix.branch }}, not on a possibly-stale fork
         working-directory: feedstock
         run: |
+          # Each line is based on ITS OWN upstream branch. Basing everything on
+          # main would rewrite an older line's recipe to the newest line's
+          # version, which is the opposite of maintaining it.
           git remote add upstream "https://github.com/${{ env.UPSTREAM }}.git"
-          git fetch -q upstream main
-          git checkout -q -B main upstream/main
+          git fetch -q upstream "${{ matrix.branch }}"
+          git checkout -q -B "ci-base-${{ matrix.channel }}" \
+            "upstream/${{ matrix.branch }}"
+          echo "based on upstream/${{ matrix.branch }} $(git rev-parse --short HEAD)"
 
       - name: Rewrite meta.yaml
         id: write
@@ -123,7 +145,7 @@ jobs:
           # Only now do we pay for ~1 GB of downloads: the plan job already
           # confirmed via version comparison that there is something to hash.
           python3 ../scripts/update-dotnet-version.py \
-            --channel "${{ needs.plan.outputs.bump_channel }}" \
+            --channel "${{ matrix.channel }}" \
             --write --summary-json ../summary.json
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
@@ -176,8 +198,10 @@ jobs:
           [ "$SECURITY" = "true" ] && title="$title (security release)"
           python3 ../scripts/render_pr_body.py ../summary.json > ../body.md
 
+          # --base is the line's own branch, not main: a 8.0 bump belongs on v8.
           url=$(gh pr create --repo "${{ env.UPSTREAM }}" \
-                  --head "${FEEDSTOCK%%/*}:$BRANCH" --base main \
+                  --head "${FEEDSTOCK%%/*}:$BRANCH" \
+                  --base "${{ matrix.branch }}" \
                   --title "$title" --body-file ../body.md)
           echo "opened $url"
           echo "$url" >> "$GITHUB_STEP_SUMMARY"

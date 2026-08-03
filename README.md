@@ -12,8 +12,8 @@ getting SHAs).
 
 **Mechanical changes become PRs. Judgment calls become issues.**
 
-A patch bump inside the tracked release line is mechanical — two version
-variables and five hashes, all derivable from published metadata. That gets a PR,
+A patch bump inside a tracked release line is mechanical — two version variables
+and one hash per platform, all derivable from published metadata. That gets a PR,
 unattended.
 
 Everything else gets escalated to a human, because the bot has no basis for
@@ -21,12 +21,42 @@ deciding:
 
 | Situation | Action |
 |---|---|
-| New SDK in the tracked channel | **PR** |
-| A new release line goes active (.NET 11, 12, …) | **issue** |
-| The tracked line reaches end of life | **issue** |
+| New SDK in a tracked line | **PR** per line, against that line's branch |
+| A line newer than anything tracked goes active | **issue** |
+| A still-supported line isn't tracked at all | **issue** (maintenance gap) |
+| A tracked line reaches EOL below its final version | **issue** |
 | Microsoft starts publishing a new architecture | **issue** |
 | Microsoft *drops* an architecture we package | **issue** (impending breakage) |
-| Nothing changed | one line in the run summary |
+| Nothing changed | a table in the run summary |
+
+## Multiple lines, not just the newest
+
+This feedstock maintains several .NET lines at once, and the bot follows that.
+Upstream branches are `main v2 v3 v5 v6 v7 v8`: when a new line takes over
+`main`, the previous one gets a `vN` branch so it can keep receiving patches.
+conda-forge accumulates every published version, so users can pin `dotnet=8`.
+
+Each tracked line is planned and bumped **independently against its own branch**,
+so a 8.0 bump lands on `v8` and never rewrites `main`'s 10.0 recipe. The bump job
+is a matrix over whatever the plan found stale, with `fail-fast: false`, so a
+problem on one line doesn't block another and their PRs cannot conflict.
+
+Tracking is declared in `channels.json`:
+
+```jsonc
+"tracked": { "10.0": "main", "8.0": "v8" }
+```
+
+At the time of writing, both were stale — `main` at `10.0.100` against
+`10.0.302`, `v8` at `8.0.407` against `8.0.423` — and **9.0 was orphaned**: it
+shipped as `9.0.203` from `main`, then 10.0 took `main` over and no `v9` branch
+was ever cut, so it sits nine patch releases behind with nowhere to patch from
+while Microsoft still lists it as `maintenance`. That is the specific failure the
+"still supported but not tracked" escalation exists to catch.
+
+EOL lines (`v3`, `v5`, `v6`, `v7`) are deliberately not watched. Each already
+sits at its line's final release, and Microsoft will publish no more, so there is
+nothing to detect.
 
 The thing it will never do is go quiet. An earlier version of this workflow
 hardcoded `matrix: channel: ["10.0"]`, which meant .NET 11 and 12 could ship
@@ -69,8 +99,8 @@ Human-owned; the automation reads it and never edits it.
 
 ```jsonc
 {
-  "track": "10.0",              // the line the feedstock currently ships
-  "policy": "lts",              // lts | latest | manual
+  "tracked": { "10.0": "main", "8.0": "v8" },   // line -> upstream branch
+  "policy": "lts",                              // lts | latest | manual
   "issue_repo": "acesnik/dotnet-feedstock-autobump",
   "rid_map":        { "win-arm64": "win-arm64", ... },   // MS RID -> cf subdir
   "ignore_rids":    ["linux-musl-x64", ...],             // no cf equivalent
@@ -79,11 +109,14 @@ Human-owned; the automation reads it and never edits it.
 }
 ```
 
-`policy` exists because a conda-forge feedstock publishes **one** `dotnet`
-package, so adopting a new line means abandoning the current one. Whether a
-scientific packaging channel should follow STS (18 months) or stay on LTS (3
-years) is not a question metadata can answer. Under `lts`, a new STS line is
-noted but raises nothing; a new LTS line raises an issue.
+`policy` governs only lines **newer** than anything tracked, since adopting one
+means moving `main` and cutting a `vN` branch for the outgoing line. Whether to
+follow STS (18 months) or stay on LTS (3 years) is not a question metadata can
+answer. Under `lts`, a new STS line is passed over silently; a new LTS line
+raises an issue.
+
+A still-supported line missing from `tracked` is escalated regardless of policy —
+that's a maintenance gap, not a preference.
 
 The set of RIDs the recipe *packages* is deliberately **not** listed here — it's
 read from `PLATFORMS` in `update-dotnet-version.py`, so the audit cannot drift
@@ -112,10 +145,11 @@ Keep `active_subdirs` in sync with what conda-forge actually builds.
 ## How a run goes
 
 ```
-plan job  ── list channels (1 GET) ─┐
-          ── read recipe versions ──┤── plan.json ──┬── bump job    (PR, ~1 GB)
-          ── list RIDs for channel ─┤               └── notify job  (issues)
-          ── HEAD subdir repodata ──┘
+plan job  ── list channels (1 GET) ────┐
+          ── git show <branch>:meta ───┤                ┌─ bump (8.0 → v8)
+          ── list RIDs for newest line ┤─ plan.json ──┬─┤  matrix, ~1 GB each
+          ── HEAD subdir repodata ─────┘              │ └─ bump (10.0 → main)
+                                                      └─── notify (issues)
 ```
 
 The **plan** job is cheap: a couple of JSON fetches and some HEAD requests. It
@@ -208,6 +242,10 @@ And the planner, from this repo:
 scripts/plan.py channels.json path/to/dotnet-feedstock | jq
 ```
 
+The checkout needs every tracked branch present as a ref (`fetch-depth: 0`);
+recipes are read with `git show <ref>:recipe/meta.yaml`, so nothing is checked
+out per line. It resolves refs across any remote name, not just `origin`.
+
 Standard library only, deliberately — everything runs in a bare container with no
 `pip install` step.
 
@@ -228,6 +266,9 @@ Standard library only, deliberately — everything runs in a bare container with
   (`10.0.1xx`, `10.0.2xx`); the tools take the release's primary `sdk` unless you
   pass `--sdk-version`.
 - **Fork and upstream are hardcoded** in the workflow's `env` block.
+- **`tracked` is maintained by hand.** The bot flags a supported line that isn't
+  tracked, but cutting the `vN` branch and adding the mapping is manual — as it
+  should be, since it decides what conda-forge keeps serving.
 - **Cross-compiled platforms may not be tested.** conda-forge can't emulate
   Windows arm64 on x64 runners, so `win_arm64` packages are built and uploaded
   without the test suite running. First real validation is a user installing it.

@@ -4,28 +4,30 @@
 The organising principle: **mechanical changes become PRs, judgment calls become
 issues.**
 
-A patch bump inside the tracked channel is mechanical -- two version variables
-and five hashes, all derivable from Microsoft's metadata. That gets a PR.
+A patch bump inside a tracked release line is mechanical -- two version variables
+and a hash per platform, all derivable from Microsoft's metadata. Each tracked
+line gets its own PR against its own branch, so concurrent bumps never conflict.
 
 Everything else needs a human:
 
-* A new release line appearing. A conda-forge feedstock publishes one `dotnet`,
-  so adopting 11.0 means abandoning 10.0. Whether a scientific packaging channel
-  should follow STS or stay on LTS is a policy question, not a data question.
-* The tracked line reaching end of life. Historically handled with a final
-  "update to end of life version" PR (dotnet-feedstock #99, #100, #103) before
-  moving on.
-* Microsoft starting to publish a new architecture. Might be worth packaging,
-  might be a subdir with no ecosystem -- see the viability check below.
-* Microsoft *dropping* an architecture the recipe packages. This one is
-  impending breakage: the next bump would fail outright when the artifact
-  can't be found.
+* A line newer than anything tracked appearing. Adopting it is a policy call
+  (LTS vs STS), not a data question.
+* A still-supported line that isn't tracked at all -- a maintenance gap. 9.0 is
+  exactly this today: published as 9.0.203 from main, then 10.0 took over main
+  and no v9 branch was ever cut, leaving it orphaned with nowhere to patch from.
+* Microsoft starting to publish a new architecture.
+* Microsoft *dropping* an architecture the recipe packages -- impending
+  breakage, since the next bump would fail outright.
+
+EOL lines are ignored by design. They sit at their final released versions and
+Microsoft will publish no more, so there is nothing to detect.
 
 Usage:
-    plan.py channels.json path/to/dotnet-feedstock          > plan.json
-    plan.py channels.json path/to/dotnet-feedstock --offline < cached.json
+    plan.py channels.json path/to/feedstock-checkout > plan.json
 
-Exit codes: 0 always (a plan with nothing in it is a valid plan). Errors exit 1.
+The checkout needs all tracked branches available as refs (fetch-depth: 0);
+recipes are read with `git show <ref>:recipe/meta.yaml` rather than from the
+working tree, so nothing has to be checked out per line.
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -41,14 +44,15 @@ from pathlib import Path
 HERE = Path(__file__).parent
 REPODATA = "https://conda.anaconda.org/conda-forge/{subdir}/repodata.json"
 USER_AGENT = "dotnet-feedstock-autobump"
+SUPPORTED = ("active", "maintenance")
 
 
 def load_updater():
     """Import the updater so PLATFORMS is read, never duplicated.
 
     The set of RIDs the recipe packages lives in exactly one place. Copying it
-    here would let the audit drift out of sync with what the recipe does, which
-    is the specific failure this is meant to detect.
+    here would let the audit drift from what the recipe actually does, which is
+    the specific failure this is meant to detect.
     """
     spec = importlib.util.spec_from_file_location(
         "updater", HERE / "update-dotnet-version.py"
@@ -65,12 +69,56 @@ def strip_comments(obj):
     return obj
 
 
-def repodata_size(subdir: str) -> int | None:
-    """Content-Length of a subdir's repodata.json, via HEAD. None if absent.
+def git_show(repo: Path, ref: str, path: str) -> str | None:
+    """Read a file at a ref without checking it out. None if the ref is absent.
 
-    A cheap proxy for "does this subdir have an ecosystem". Actually counting
-    packages would mean downloading linux-64's ~432 MB repodata, which is not
-    viable in CI. Heuristic, not a guarantee.
+    Tries the bare ref, then the conventional remotes, then any remote at all --
+    a CI checkout names the remote `origin`, but a developer's clone of this
+    feedstock may well not (this one calls upstream `originDoNotPushHere`).
+    """
+    candidates = [ref, f"origin/{ref}", f"upstream/{ref}"]
+    remotes = subprocess.run(
+        ["git", "-C", str(repo), "remote"], capture_output=True, text=True
+    )
+    if remotes.returncode == 0:
+        candidates += [f"{r}/{ref}" for r in remotes.stdout.split()]
+    # Remote-tracking refs may also live under a custom refspec namespace.
+    allrefs = subprocess.run(
+        ["git", "-C", str(repo), "for-each-ref", "--format=%(refname:short)",
+         "refs/remotes"],
+        capture_output=True, text=True,
+    )
+    if allrefs.returncode == 0:
+        candidates += [r for r in allrefs.stdout.split() if r.endswith(f"/{ref}")]
+
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        r = subprocess.run(
+            ["git", "-C", str(repo), "show", f"{candidate}:{path}"],
+            capture_output=True,
+            text=True,
+        )
+        if r.returncode == 0:
+            return r.stdout
+    return None
+
+
+def recipe_versions(text: str) -> tuple[str, str]:
+    sdk = re.search(r'set\s+sdk_version\s*=\s*"([^"]*)"', text)
+    rt = re.search(r'set\s+runtime_version\s*=\s*"([^"]*)"', text)
+    return (sdk.group(1) if sdk else "?", rt.group(1) if rt else "?")
+
+
+def repodata_size(subdir: str) -> int | None:
+    """Content-Length of a subdir's repodata.json via HEAD. None if absent.
+
+    A cheap proxy for "does this subdir have an ecosystem". Counting packages
+    properly would mean downloading linux-64's ~432 MB repodata, which CI can't
+    do. Heuristic, not a guarantee -- and see active_subdirs in channels.json for
+    the failure mode it does not catch.
     """
     req = urllib.request.Request(
         REPODATA.format(subdir=subdir),
@@ -81,182 +129,184 @@ def repodata_size(subdir: str) -> int | None:
         with urllib.request.urlopen(req, timeout=45) as resp:
             n = resp.headers.get("Content-Length")
             return int(n) if n else None
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return None
-        return None
-    except urllib.error.URLError:
+    except (urllib.error.HTTPError, urllib.error.URLError):
         return None
 
 
-def recipe_versions(recipe: Path) -> tuple[str, str]:
-    text = recipe.read_text()
-    sdk = re.search(r'set\s+sdk_version\s*=\s*"([^"]*)"', text)
-    rt = re.search(r'set\s+runtime_version\s*=\s*"([^"]*)"', text)
-    return (sdk.group(1) if sdk else "?", rt.group(1) if rt else "?")
-
-
-def channel_sort_key(ch: str):
+def ckey(ch: str):
     return [int(x) if x.isdigit() else 0 for x in ch.split(".")]
 
 
-def plan_channels(cfg: dict, channels: list[dict], cur_sdk: str) -> tuple[dict, list]:
-    """Decide whether to bump, and whether any channel change needs escalating."""
-    track = cfg["track"]
+def plan_lines(cfg, channels, repo: Path):
+    """Per-line bumps, plus escalations about which lines exist at all."""
+    tracked: dict[str, str] = cfg.get("tracked", {})
     policy = cfg.get("policy", "manual")
-    issues: list[dict] = []
+    by_ch = {c["channel"]: c for c in channels}
+    bumps, issues, lines = [], [], []
 
-    tracked = next((c for c in channels if c["channel"] == track), None)
-    if tracked is None:
-        issues.append(
-            {
-                "key": f"tracked-channel-missing-{track}",
-                "title": f"Tracked channel {track} is no longer in Microsoft's release index",
-                "body": (
-                    f"`channels.json` tracks **{track}**, but that channel is not "
-                    "present in `releases-index.json` any more.\n\n"
-                    "Nothing can be bumped until `track` is corrected."
-                ),
-            }
-        )
-        return {}, issues
+    newest_tracked = max(tracked, key=ckey) if tracked else None
 
-    bump = {}
-    if tracked["latest_sdk"] != cur_sdk:
-        bump = {
-            "channel": track,
-            "current_sdk": cur_sdk,
-            "latest_sdk": tracked["latest_sdk"],
-        }
-
-    # Tracked line going EOL is a decision, not a bump.
-    if tracked["support_phase"] == "eol":
-        issues.append(
-            {
-                "key": f"tracked-eol-{track}",
-                "title": f"Tracked channel {track} has reached end of life",
-                "body": (
-                    f"`channels.json` tracks **{track}**, whose `support-phase` is "
-                    f"now `eol` (EOL date: {tracked.get('eol_date') or 'unstated'}).\n\n"
-                    f"The pattern in this feedstock's history is a final "
-                    f"\"update to end of life version\" PR "
-                    f"(conda-forge/dotnet-feedstock#99, #100, #103), then moving "
-                    f"`track` forward.\n\n"
-                    f"Latest {track} SDK is `{tracked['latest_sdk']}`; the recipe "
-                    f"has `{cur_sdk}`."
-                ),
-            }
-        )
-
-    # Candidate newer lines, judged against the declared policy.
-    if policy != "manual":
-        for c in channels:
-            if channel_sort_key(c["channel"]) <= channel_sort_key(track):
-                continue
-            if c["support_phase"] != "active":
-                continue  # preview is not a candidate; we don't ship previews
-            if policy == "lts" and c["release_type"] != "lts":
-                # Still worth one line in the plan so it isn't invisible, but no
-                # issue: the declared policy already answers this.
-                continue
+    for ch, branch in sorted(tracked.items(), key=lambda kv: ckey(kv[0])):
+        meta = git_show(repo, branch, "recipe/meta.yaml")
+        info = by_ch.get(ch)
+        if meta is None:
             issues.append(
                 {
-                    "key": f"new-channel-{c['channel']}",
+                    "key": f"missing-branch-{branch}",
+                    "title": f"Tracked branch `{branch}` for .NET {ch} does not exist",
+                    "body": (
+                        f"`channels.json` maps **{ch}** to branch `{branch}`, but "
+                        "that ref isn't present in the feedstock checkout.\n\n"
+                        "Either the branch was deleted or `tracked` is wrong. "
+                        f"Nothing can be bumped for {ch} until this is resolved."
+                    ),
+                }
+            )
+            continue
+        cur_sdk, cur_rt = recipe_versions(meta)
+        if info is None:
+            issues.append(
+                {
+                    "key": f"channel-gone-{ch}",
+                    "title": f".NET {ch} is no longer in Microsoft's release index",
+                    "body": (
+                        f"`{branch}` ships **{cur_sdk}** for line {ch}, but {ch} is "
+                        "absent from `releases-index.json`. Likely removed after "
+                        "EOL; consider dropping it from `tracked`."
+                    ),
+                }
+            )
+            continue
+
+        phase = info["support_phase"]
+        entry = {
+            "channel": ch,
+            "branch": branch,
+            "current_sdk": cur_sdk,
+            "current_runtime": cur_rt,
+            "latest_sdk": info["latest_sdk"],
+            "support_phase": phase,
+            "stale": info["latest_sdk"] != cur_sdk,
+        }
+        lines.append(entry)
+
+        if phase == "eol":
+            # EOL lines are not watched, but one already in `tracked` that has
+            # *just* gone EOL still deserves its final bump -- the #99/#100/#103
+            # pattern -- before being dropped.
+            if entry["stale"]:
+                issues.append(
+                    {
+                        "key": f"eol-final-bump-{ch}",
+                        "title": f".NET {ch} reached EOL at {info['latest_sdk']}; `{branch}` has {cur_sdk}",
+                        "body": (
+                            f"Line **{ch}** is now `eol`. Its final release is "
+                            f"`{info['latest_sdk']}` but `{branch}` still ships "
+                            f"`{cur_sdk}`.\n\n"
+                            "The convention here is a final \"update to end of life "
+                            "version\" PR (conda-forge/dotnet-feedstock#99, #100, "
+                            f"#103), then removing {ch} from `tracked`."
+                        ),
+                    }
+                )
+            continue
+
+        if entry["stale"]:
+            bumps.append(entry)
+
+    # Lines Microsoft still supports that we don't track at all.
+    for ch, info in sorted(by_ch.items(), key=lambda kv: ckey(kv[0])):
+        if ch in tracked or info["support_phase"] not in SUPPORTED:
+            continue
+        if newest_tracked and ckey(ch) > ckey(newest_tracked):
+            # Newer than everything tracked: a policy decision, gated below.
+            continue
+        issues.append(
+            {
+                "key": f"untracked-supported-{ch}",
+                "title": f".NET {ch} is still supported but no branch tracks it",
+                "body": (
+                    f"Microsoft lists **{ch}** as `{info['support_phase']}` "
+                    f"(`{info['release_type']}`), latest SDK "
+                    f"`{info['latest_sdk']}`, but `channels.json` has no branch "
+                    f"for it, so it cannot receive patches.\n\n"
+                    "This is how a line gets orphaned: it ships from `main`, a "
+                    "newer line takes `main` over, and no `vN` branch is cut on "
+                    "the way past. conda-forge keeps serving the last version "
+                    "published, indefinitely, with no way to update it.\n\n"
+                    f"To fix: cut a `v{ch.split('.')[0]}` branch from the commit "
+                    f"where `main` last carried a {ch} recipe, then add "
+                    f"`\"{ch}\": \"v{ch.split('.')[0]}\"` to `tracked`."
+                ),
+            }
+        )
+
+    # Newer-than-tracked candidate lines, judged against declared policy.
+    if policy != "manual" and newest_tracked:
+        for ch, info in sorted(by_ch.items(), key=lambda kv: ckey(kv[0])):
+            if ckey(ch) <= ckey(newest_tracked) or ch in tracked:
+                continue
+            if info["support_phase"] != "active":
+                continue  # never propose shipping a preview
+            if policy == "lts" and info["release_type"] != "lts":
+                continue  # declared policy already answers this
+            issues.append(
+                {
+                    "key": f"new-channel-{ch}",
                     "title": (
-                        f".NET {c['channel']} is now active "
-                        f"({c['release_type'].upper()}) -- decide whether to track it"
+                        f".NET {ch} is now active "
+                        f"({info['release_type'].upper()}) -- decide whether to track it"
                     ),
                     "body": (
-                        f"Microsoft's release index now lists **{c['channel']}** as "
-                        f"`support-phase: active`, `release-type: "
-                        f"`{c['release_type']}`, latest SDK `{c['latest_sdk']}`.\n\n"
-                        f"This feedstock tracks **{track}** "
-                        f"(`{tracked['release_type']}`), per `channels.json` with "
+                        f"Microsoft lists **{ch}** as `active`, "
+                        f"`{info['release_type']}`, latest SDK "
+                        f"`{info['latest_sdk']}`.\n\n"
+                        f"Newest tracked line is **{newest_tracked}** "
+                        f"(branch `{tracked[newest_tracked]}`), with "
                         f"`policy: {policy}`.\n\n"
-                        "A conda-forge feedstock publishes one `dotnet` package, so "
-                        "adopting a new line means leaving the current one. Options:\n\n"
-                        f"- Switch: set `track` to `{c['channel']}` and open a "
-                        f"`v{c['channel'].split('.')[0]}update` branch.\n"
-                        f"- Stay on {track} and revisit when it nears EOL.\n"
-                        f"- Bump {track} to its final version first "
-                        "(the #99/#100/#103 pattern), then switch.\n\n"
+                        "The convention here is that the newest line lives on "
+                        f"`main` and the previous one gets a `vN` branch. So "
+                        f"adopting {ch} means: cut "
+                        f"`v{newest_tracked.split('.')[0]}` from `main` first (so "
+                        f"{newest_tracked} stays patchable), then move `main` to "
+                        f"{ch} and update `tracked`.\n\n"
                         "No PR was opened -- this is a policy decision."
                     ),
                 }
             )
-    return bump, issues
+    return bumps, issues, lines
 
 
-def plan_rids(cfg: dict, offered: list[str], packaged: set[str]) -> list[dict]:
+def plan_rids(cfg, offered, packaged):
     """Audit the architectures Microsoft offers against the ones we package."""
     rid_map = cfg.get("rid_map", {})
     ignore = set(cfg.get("ignore_rids", []))
     active = set(cfg.get("active_subdirs", []))
     threshold = int(cfg.get("min_repodata_bytes", 0))
-    issues: list[dict] = []
+    issues, skipped = [], []
 
-    # Dropped: packaged but no longer offered. This breaks the next bump.
     for rid in sorted(packaged - set(offered)):
         issues.append(
             {
                 "key": f"rid-dropped-{rid}",
                 "title": f"Microsoft no longer publishes {rid} -- recipe still packages it",
                 "body": (
-                    f"`{rid}` is in the recipe's platform set but is **not** in the "
-                    "SDK artifacts Microsoft publishes for the tracked channel.\n\n"
+                    f"`{rid}` is in the recipe's platform set but is **not** among "
+                    "the SDK artifacts Microsoft publishes.\n\n"
                     "This is impending breakage, not an opportunity: the next "
-                    "version bump will fail outright when the artifact cannot be "
-                    "found. The recipe's selectors and `PLATFORMS` both need "
-                    "updating, and the corresponding conda-forge platform should "
-                    "be dropped from `conda-forge.yml`."
+                    "version bump fails outright when the artifact cannot be "
+                    "found. Both the recipe's selectors and `PLATFORMS` need "
+                    "updating, and the conda-forge platform should be dropped "
+                    "from `conda-forge.yml`."
                 ),
             }
         )
 
-    # Added: offered, mappable, viable, but not packaged.
-    for rid in sorted(set(offered) - packaged - ignore):
-        subdir = rid_map.get(rid)
-        if subdir is None:
-            continue  # unmappable and not explicitly ignored -- stay quiet
-        if subdir not in active:
-            continue  # frozen subdir, e.g. win-32 (last built 2019)
-        size = repodata_size(subdir)
-        if size is None:
-            continue  # conda-forge has no such subdir at all
-        if size < threshold:
-            continue  # subdir exists but has no ecosystem (the armv7l case)
-        issues.append(
-            {
-                "key": f"rid-available-{rid}",
-                "title": f"Microsoft publishes {rid} -- candidate for conda-forge {subdir}",
-                "body": (
-                    f"Microsoft publishes an SDK archive for **{rid}**, which maps "
-                    f"to conda-forge's `{subdir}`. The recipe does not package it.\n\n"
-                    f"`{subdir}` looks viable: its `repodata.json` is "
-                    f"{size:,} bytes (threshold {threshold:,}), so it has a real "
-                    "package ecosystem to depend on.\n\n"
-                    "Adding it means:\n\n"
-                    f"1. a `sha256` and `platform` selector pair for `{rid}`;\n"
-                    "2. **narrowing** any existing broader selector so it stops "
-                    "matching the new arch -- this bit is easy to get wrong and "
-                    "silently ships the wrong hash;\n"
-                    f"3. `build_platform: {{{subdir.replace('-', '_')}: ...}}` in "
-                    "`conda-forge.yml` if cross-compiling;\n"
-                    f"4. adding `{rid}` to `PLATFORMS` in the updater;\n"
-                    "5. a rerender, or the platform is declared but never built.\n\n"
-                    "Note tests may be skipped for a cross-compiled platform, so "
-                    "the first real validation is a user installing it."
-                ),
-            }
-        )
-
-    # Offered but non-viable / unmappable: reported in the plan, no issue raised.
-    skipped = []
     for rid in sorted(set(offered) - packaged):
+        subdir = rid_map.get(rid)
         if rid in ignore:
             skipped.append({"rid": rid, "reason": "no conda-forge equivalent"})
             continue
-        subdir = rid_map.get(rid)
         if subdir is None:
             skipped.append({"rid": rid, "reason": "unmapped"})
             continue
@@ -268,10 +318,35 @@ def plan_rids(cfg: dict, offered: list[str], packaged: set[str]) -> list[dict]:
         size = repodata_size(subdir)
         if size is None:
             skipped.append({"rid": rid, "reason": f"no {subdir} subdir"})
-        elif size < threshold:
+            continue
+        if size < threshold:
             skipped.append(
                 {"rid": rid, "reason": f"{subdir} repodata only {size:,} B -- no ecosystem"}
             )
+            continue
+        issues.append(
+            {
+                "key": f"rid-available-{rid}",
+                "title": f"Microsoft publishes {rid} -- candidate for conda-forge {subdir}",
+                "body": (
+                    f"Microsoft publishes an SDK archive for **{rid}**, mapping to "
+                    f"conda-forge's `{subdir}`, which the recipe does not package.\n\n"
+                    f"`{subdir}` looks viable: `repodata.json` is {size:,} bytes "
+                    f"(threshold {threshold:,}), so there is a real package "
+                    "ecosystem to depend on.\n\n"
+                    "Adding it means:\n\n"
+                    f"1. a `sha256` and `platform` selector pair for `{rid}`;\n"
+                    "2. **narrowing** any existing broader selector so it stops "
+                    "matching the new arch -- easy to miss, and silently ships "
+                    "the wrong hash if you do;\n"
+                    f"3. `build_platform` in `conda-forge.yml` if cross-compiling;\n"
+                    f"4. adding `{rid}` to `PLATFORMS` in the updater;\n"
+                    "5. a rerender, or the platform is declared but never built.\n\n"
+                    "Tests may be skipped for a cross-compiled platform, so the "
+                    "first real validation is a user installing it."
+                ),
+            }
+        )
     return issues, skipped
 
 
@@ -280,16 +355,13 @@ def main(argv: list[str]) -> int:
         print(__doc__, file=sys.stderr)
         return 1
     cfg = strip_comments(json.loads(Path(argv[1]).read_text()))
-    feedstock = Path(argv[2])
-    recipe = feedstock / "recipe" / "meta.yaml"
-    if not recipe.exists():
-        print(f"error: {recipe} not found", file=sys.stderr)
-        return 1
+    repo = Path(argv[2])
 
     updater = load_updater()
     packaged = {rid for _sel, rid, _ext in updater.PLATFORMS}
 
     index = updater.fetch_json(updater.INDEX_URL)
+    raw = index.get("releases-index", [])
     channels = [
         {
             "channel": e.get("channel-version"),
@@ -298,30 +370,29 @@ def main(argv: list[str]) -> int:
             "latest_sdk": e.get("latest-sdk"),
             "eol_date": e.get("eol-date"),
         }
-        for e in index.get("releases-index", [])
+        for e in raw
     ]
 
-    cur_sdk, cur_rt = recipe_versions(recipe)
-    bump, issues = plan_channels(cfg, channels, cur_sdk)
+    bumps, issues, lines = plan_lines(cfg, channels, repo)
 
+    # Architectures are audited once, against the newest tracked line: the RID
+    # set is a property of .NET, not of a patch release.
     offered: list[str] = []
-    tracked = next((c for c in channels if c["channel"] == cfg["track"]), None)
-    if tracked:
+    if lines:
+        newest = max(lines, key=lambda l: ckey(l["channel"]))
         entry = next(
-            e
-            for e in index["releases-index"]
-            if e.get("channel-version") == cfg["track"]
+            (e for e in raw if e.get("channel-version") == newest["channel"]), None
         )
-        releases = updater.fetch_json(entry["releases.json"]).get("releases", [])
-        if releases:
-            sdk = releases[0]["sdk"]
-            offered = sorted(
-                {
-                    f["rid"]
-                    for f in sdk.get("files", [])
-                    if str(f.get("name", "")).endswith((".tar.gz", ".zip"))
-                }
-            )
+        if entry:
+            releases = updater.fetch_json(entry["releases.json"]).get("releases", [])
+            if releases:
+                offered = sorted(
+                    {
+                        f["rid"]
+                        for f in releases[0]["sdk"].get("files", [])
+                        if str(f.get("name", "")).endswith((".tar.gz", ".zip"))
+                    }
+                )
 
     rid_issues, rid_skipped = plan_rids(cfg, offered, packaged) if offered else ([], [])
     issues.extend(rid_issues)
@@ -329,17 +400,15 @@ def main(argv: list[str]) -> int:
     print(
         json.dumps(
             {
-                "track": cfg["track"],
                 "policy": cfg.get("policy"),
                 "issue_repo": cfg.get("issue_repo"),
-                "recipe": {"sdk_version": cur_sdk, "runtime_version": cur_rt},
-                "channels": channels,
+                "lines": lines,
+                "bumps": bumps,
                 "rids": {
                     "offered": offered,
                     "packaged": sorted(packaged),
                     "skipped": rid_skipped,
                 },
-                "bump": bump or None,
                 "issues": issues,
             },
             indent=2,

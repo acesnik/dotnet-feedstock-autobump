@@ -14,14 +14,38 @@
     "answer -- hence `policy` below, and hence new lines become issues, not PRs."
   ],
 
-  "track": "10.0",
+  "_tracked_comment": [
+    "Release line -> the upstream feedstock branch that ships it.",
+    "",
+    "This feedstock maintains several lines at once. Upstream branches are",
+    "main v2 v3 v5 v6 v7 v8: when a new line takes over `main`, the previous one",
+    "gets a `vN` branch so it can keep receiving patches. conda-forge accumulates",
+    "every published version, so users can pin `dotnet=8`.",
+    "",
+    "Each tracked line is planned and bumped independently against its own",
+    "branch, so concurrent bumps never conflict.",
+    "",
+    "EOL lines (v3, v5, v6, v7) are deliberately absent: they sit at their",
+    "final released versions and Microsoft will publish no more, so there is",
+    "nothing to detect and watching them would only add noise."
+  ],
+  "tracked": {
+    "10.0": "main",
+    "8.0": "v8"
+  },
 
   "_policy_comment": [
-    "What we WANT to track, used to judge whether a newly-active channel is a",
-    "candidate worth escalating:",
+    "What we WANT to track, used to judge whether a NEWER channel than anything",
+    "in `tracked` is worth escalating:",
     "  lts    - only Long Term Support lines (3 yr). 10.0 is LTS, 11.0 is STS.",
     "  latest - newest active line regardless of support type.",
-    "  manual - never escalate; only bump within `track`."
+    "  manual - never escalate; only bump what is already in `tracked`.",
+    "",
+    "Separately, and regardless of policy: a line that is still supported",
+    "(active or maintenance) but absent from `tracked` gets escalated as a",
+    "maintenance gap. 9.0 is exactly that today -- it was published as 9.0.203",
+    "from main, then 10.0 replaced it and no v9 branch was ever cut, so it is",
+    "orphaned nine patch releases behind with no branch to update it from."
   ],
   "policy": "lts",
 
