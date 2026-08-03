@@ -143,8 +143,8 @@ Human-owned; the automation reads it and never edits it.
 `policy` governs only lines **newer** than anything tracked, since adopting one
 means moving `main` and cutting a `vN` branch for the outgoing line. Whether to
 follow STS (18 months) or stay on LTS (3 years) is not a question metadata can
-answer. Under `lts`, a new STS line is passed over silently; a new LTS line
-raises an issue.
+answer. Under `lts`, a new STS line raises no issue but does produce a notice; a
+new LTS line raises an issue.
 
 A still-supported line missing from `tracked` is escalated regardless of policy —
 that's a maintenance gap, not a preference.
