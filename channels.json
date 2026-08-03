@@ -1,0 +1,102 @@
+{
+  "_comment": [
+    "Declared policy for what the dotnet feedstock tracks. Human-owned: the",
+    "automation reads this and never edits it. Everything the bot cannot decide",
+    "for itself is decided here, or escalated as a GitHub issue.",
+    "",
+    "Why this file exists: the workflow used to hardcode `channel: ['10.0']` in a",
+    "matrix, which meant .NET 11 and 12 would ship and the bot would stay silent",
+    "forever while still reporting success. Blindness that looks like health.",
+    "",
+    "A conda-forge feedstock publishes ONE `dotnet` package, so tracking a new",
+    "release line means leaving the old one. That is a judgment call about what",
+    "users of a scientific packaging channel want, not something metadata can",
+    "answer -- hence `policy` below, and hence new lines become issues, not PRs."
+  ],
+
+  "track": "10.0",
+
+  "_policy_comment": [
+    "What we WANT to track, used to judge whether a newly-active channel is a",
+    "candidate worth escalating:",
+    "  lts    - only Long Term Support lines (3 yr). 10.0 is LTS, 11.0 is STS.",
+    "  latest - newest active line regardless of support type.",
+    "  manual - never escalate; only bump within `track`."
+  ],
+  "policy": "lts",
+
+  "_issue_repo_comment": [
+    "Where judgment-call issues get filed. Defaults to this repo rather than the",
+    "feedstock so an unattended bot does not post into a shared conda-forge repo.",
+    "Point it at conda-forge/dotnet-feedstock if you would rather co-maintainers",
+    "see them -- the token needs issues:write there if you do."
+  ],
+  "issue_repo": "acesnik/dotnet-feedstock-autobump",
+
+  "_rid_map_comment": [
+    "Microsoft RID -> conda-forge subdir. Used to audit which architectures",
+    "Microsoft offers against which the recipe actually packages. The set the",
+    "recipe packages is NOT duplicated here; it is read from PLATFORMS in",
+    "update-dotnet-version.py so the two cannot drift.",
+    "",
+    "A RID mapped here is *mappable*, not necessarily *viable* -- see",
+    "min_repodata_bytes."
+  ],
+  "rid_map": {
+    "linux-x64": "linux-64",
+    "linux-arm64": "linux-aarch64",
+    "linux-arm": "linux-armv7l",
+    "osx-x64": "osx-64",
+    "osx-arm64": "osx-arm64",
+    "win-x64": "win-64",
+    "win-arm64": "win-arm64",
+    "win-x86": "win-32"
+  },
+
+  "_ignore_rids_comment": [
+    "RIDs with no usable conda-forge equivalent. conda-forge has no musl subdir,",
+    "so those can never be packaged and should not generate recurring noise."
+  ],
+  "ignore_rids": [
+    "linux-musl-x64",
+    "linux-musl-arm64",
+    "linux-musl-arm"
+  ],
+
+  "_active_subdirs_comment": [
+    "conda-forge subdirs that are actively built. This is the PRIMARY viability",
+    "gate and it is declared, not inferred, because inference got it wrong:",
+    "",
+    "The repodata-size heuristic alone passed win-32 (10.4 MB, 24,464 packages),",
+    "but conda-forge stopped building win-32 in 2019 -- newest package there is",
+    "dated 2019-02-20. Size distinguishes 'has an ecosystem' from 'empty', but",
+    "not 'thriving' from 'frozen and abandoned'. Detecting that from timestamps",
+    "would mean downloading repodata (432 MB for linux-64), which CI cannot do.",
+    "",
+    "So: a subdir must be listed here AND pass min_repodata_bytes. Keep this in",
+    "sync with what conda-forge actually builds."
+  ],
+  "active_subdirs": [
+    "linux-64",
+    "linux-aarch64",
+    "linux-ppc64le",
+    "osx-64",
+    "osx-arm64",
+    "win-64",
+    "win-arm64"
+  ],
+
+  "_viability_comment": [
+    "A conda-forge subdir existing is not the same as it being usable. Learned",
+    "the hard way on issue #115: linux-armv7l is a real subdir whose repodata is",
+    "1,306 bytes -- 3 packages, no icu/openssl/zlib -- so a dotnet built there",
+    "would install and be unusable. win-arm64's repodata is ~777 KB (1,927",
+    "packages) and is fine.",
+    "",
+    "repodata.json Content-Length is a deliberately cheap proxy for ecosystem",
+    "size: one HEAD request, no download. linux-64's repodata is ~432 MB, so",
+    "actually fetching these to count packages is not an option in CI.",
+    "It is a heuristic, not a guarantee."
+  ],
+  "min_repodata_bytes": 102400
+}

@@ -298,7 +298,8 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description="Update recipe/meta.yaml from Microsoft's .NET release metadata."
     )
-    src = p.add_mutually_exclusive_group(required=True)
+    # Not required: --list-channels needs no channel at all.
+    src = p.add_mutually_exclusive_group(required=False)
     src.add_argument("--channel", help='release channel, e.g. "10.0"')
     src.add_argument("--sdk-version", help='exact SDK version, e.g. "10.0.302"')
     # Relative to the CWD, not to this script: the script lives outside the
@@ -337,11 +338,53 @@ def main(argv: list[str] | None = None) -> int:
         help="write release facts (versions, security flag, CVE ids) here as JSON",
     )
     p.add_argument(
+        "--list-channels",
+        action="store_true",
+        help=(
+            "print every channel Microsoft publishes as JSON (channel, "
+            "support-phase, release-type, latest-release, latest-sdk) and exit. "
+            "Pure data -- policy lives in channels.json, applied by plan.py."
+        ),
+    )
+    p.add_argument(
+        "--list-rids",
+        action="store_true",
+        help=(
+            "print the SDK RIDs Microsoft publishes for --channel as JSON and "
+            "exit. Used to audit offered architectures against packaged ones."
+        ),
+    )
+    p.add_argument(
         "--no-reset-build-number",
         action="store_true",
         help="keep build.number instead of resetting to 0 on a version change",
     )
     args = p.parse_args(argv)
+
+    # Discovery mode: no channel needed, emit the whole index and stop.
+    if args.list_channels:
+        index = fetch_json(INDEX_URL)
+        print(
+            json.dumps(
+                [
+                    {
+                        "channel": e.get("channel-version"),
+                        "support_phase": e.get("support-phase"),
+                        "release_type": e.get("release-type"),
+                        "latest_release": e.get("latest-release"),
+                        "latest_release_date": e.get("latest-release-date"),
+                        "latest_sdk": e.get("latest-sdk"),
+                        "eol_date": e.get("eol-date"),
+                    }
+                    for e in index.get("releases-index", [])
+                ],
+                indent=2,
+            )
+        )
+        return 0
+
+    if not args.channel and not args.sdk_version:
+        p.error("one of --channel / --sdk-version is required (or use --list-channels)")
 
     channel = args.channel
     if channel is None:
@@ -378,6 +421,31 @@ def main(argv: list[str] | None = None) -> int:
             f"  note: security release -- {len(cves)} CVE(s): "
             + (", ".join(cves) if cves else "ids not listed")
         )
+
+    if args.list_rids:
+        # Every RID this SDK publishes an archive for, with the archive name so a
+        # caller can tell a .tar.gz/.zip from an installer-only RID.
+        rids: dict[str, list[str]] = {}
+        for f in sdk.get("files", []):
+            rids.setdefault(f.get("rid", "?"), []).append(f.get("name", "?"))
+        print(
+            json.dumps(
+                {
+                    "channel": channel,
+                    "sdk_version": sdk_version,
+                    "rids": {
+                        rid: sorted(names) for rid, names in sorted(rids.items())
+                    },
+                    "archive_rids": sorted(
+                        rid
+                        for rid, names in rids.items()
+                        if any(n.endswith((".tar.gz", ".zip")) for n in names)
+                    ),
+                },
+                indent=2,
+            )
+        )
+        return 0
 
     if args.summary_json:
         args.summary_json.write_text(
