@@ -51,15 +51,18 @@ problem on one line doesn't block another and their PRs cannot conflict.
 Tracking is declared in `channels.json`:
 
 ```jsonc
-"tracked": { "10.0": "main", "8.0": "v8" }
+"tracked": { "10.0": "main", "9.0": "v9", "8.0": "v8" }
 ```
 
-At the time of writing, both were stale — `main` at `10.0.100` against
-`10.0.302`, `v8` at `8.0.407` against `8.0.423` — and **9.0 was orphaned**: it
-shipped as `9.0.203` from `main`, then 10.0 took `main` over and no `v9` branch
-was ever cut, so it sits nine patch releases behind with nowhere to patch from
-while Microsoft still lists it as `maintenance`. That is the specific failure the
-"still supported but not tracked" escalation exists to catch.
+All three were stale at the time of writing — `main` at `10.0.100` against
+`10.0.302`, `v9` against `9.0.316`, `v8` at `8.0.407` against `8.0.423`.
+
+**9.0 was orphaned until recently**, and it is the clearest illustration of why
+this matters: it shipped as `9.0.203` from `main`, then 10.0 took `main` over and
+no `v9` branch was ever cut, so it sat nine patch releases behind with nowhere to
+patch from while Microsoft still listed it as `maintenance`. The
+"still supported but not tracked" escalation exists to catch exactly that; `v9`
+has since been cut and the line is tracked again.
 
 EOL lines (`v3`, `v5`, `v6`, `v7`) are deliberately not watched. Each already
 sits at its line's final release, and Microsoft will publish no more, so there is
@@ -165,7 +168,7 @@ Human-owned; the automation reads it and never edits it.
 
 ```jsonc
 {
-  "tracked": { "10.0": "main", "8.0": "v8" },   // line -> upstream branch
+  "tracked": { "10.0": "main", "9.0": "v9", "8.0": "v8" },  // line -> branch
   "policy": "lts",                              // lts | latest | manual
   "issue_repo": "acesnik/dotnet-feedstock-autobump",
   "rid_map":        { "win-arm64": "win-arm64", ... },   // MS RID -> cf subdir
