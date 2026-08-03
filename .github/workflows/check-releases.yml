@@ -1,0 +1,200 @@
+# Watches Microsoft's .NET release metadata and opens a version-bump PR against
+# conda-forge/dotnet-feedstock when a new SDK ships.
+#
+# Why this lives outside the feedstock: a conda-forge feedstock's .gitignore is
+#   *
+#   !/conda-forge.yml
+#   !/recipe/**
+#   !/.ci_support/**
+# with the comment "Everything else is managed by the conda-smithy rerender
+# process. Please do not modify". So a helper script or workflow cannot be hosted
+# at a feedstock root -- a rerender owns that space. Running the automation from
+# a separate repo sidesteps the question entirely; the artifact a PR needs is just
+# the meta.yaml diff.
+name: check-dotnet-releases
+
+on:
+  schedule:
+    # Mondays. Deliberately not on the hour -- every cron everyone writes lands
+    # on :00, and this job has no reason to join the stampede.
+    - cron: "23 7 * * 1"
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Release channel to check (blank = all in the matrix)"
+        type: string
+        required: false
+      dry_run:
+        description: "Probe and hash, but do not push or open a PR"
+        type: boolean
+        required: false
+        default: true
+
+# Read-only by default. Pushing to the fork and opening the PR uses
+# FEEDSTOCK_TOKEN, not the workflow token, because GITHUB_TOKEN cannot write to
+# another repository.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Only channels the feedstock actually ships. .NET 11 is preview as of
+        # this writing -- adding it here would open PRs bumping the package to a
+        # preview build, which is not what `conda install dotnet` should give
+        # people. Add it when 11.0 reaches `support-phase: active`.
+        channel: ["10.0"]
+    steps:
+      - name: Skip channels not requested
+        id: gate
+        run: |
+          want="${{ inputs.channel }}"
+          if [ -n "$want" ] && [ "$want" != "${{ matrix.channel }}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::skipping ${{ matrix.channel }} (only $want requested)"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out this repo
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/checkout@v4
+
+      - name: Check out the feedstock fork
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/checkout@v4
+        with:
+          repository: acesnik/dotnet-feedstock
+          path: feedstock
+          # Needs push access to the fork. A PAT is required: GITHUB_TOKEN is
+          # scoped to this repo only.
+          token: ${{ secrets.FEEDSTOCK_TOKEN }}
+          fetch-depth: 0
+
+      - name: Sync the fork's main with upstream
+        if: steps.gate.outputs.skip == 'false'
+        working-directory: feedstock
+        run: |
+          # Base the bump on upstream, not on whatever the fork last had --
+          # otherwise a stale fork silently produces a PR full of unrelated
+          # reverts.
+          git remote add upstream https://github.com/conda-forge/dotnet-feedstock.git
+          git fetch -q upstream main
+          git checkout -q -B main upstream/main
+          echo "based on upstream/main $(git rev-parse --short HEAD)"
+
+      - name: Probe for a new release (no downloads)
+        if: steps.gate.outputs.skip == 'false'
+        id: probe
+        working-directory: feedstock
+        run: |
+          set +e
+          out=$(python3 ../scripts/update-dotnet-version.py \
+                  --channel "${{ matrix.channel }}" --probe \
+                  --summary-json ../summary.json)
+          rc=$?
+          set -e
+          echo "$out"
+          case "$rc" in
+            0)  echo "stale=false" >> "$GITHUB_OUTPUT"
+                echo "::notice::${{ matrix.channel }} is up to date" ;;
+            10) echo "stale=true"  >> "$GITHUB_OUTPUT"
+                echo "::notice::${{ matrix.channel }}: $out" ;;
+            *)  echo "::error::probe failed (exit $rc)"; exit "$rc" ;;
+          esac
+
+      - name: Compute hashes and rewrite meta.yaml
+        if: steps.gate.outputs.skip == 'false' && steps.probe.outputs.stale == 'true'
+        id: bump
+        working-directory: feedstock
+        run: |
+          # Only now do we pay for ~1 GB of downloads. This is the whole reason
+          # --probe exists: a weekly cron that usually finds nothing should cost
+          # two HTTP requests, not a gigabyte.
+          python3 ../scripts/update-dotnet-version.py \
+            --channel "${{ matrix.channel }}" --write
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          d = json.load(open("../summary.json"))
+          print(f"sdk={d['sdk_version']}")
+          print(f"runtime={d['runtime_version']}")
+          print(f"security={str(d['security']).lower()}")
+          print(f"branch=autobump/{d['sdk_version']}")
+          PY
+
+      - name: Bail out if the branch already exists
+        if: steps.gate.outputs.skip == 'false' && steps.probe.outputs.stale == 'true'
+        id: exists
+        working-directory: feedstock
+        run: |
+          # One branch per SDK version, so re-runs are idempotent and we never
+          # force-push over a branch a human has been working on.
+          if git ls-remote --exit-code --heads origin \
+               "${{ steps.bump.outputs.branch }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${{ steps.bump.outputs.branch }} already exists - nothing to do"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Show the diff
+        if: steps.gate.outputs.skip == 'false' && steps.probe.outputs.stale == 'true'
+        working-directory: feedstock
+        run: |
+          git --no-pager diff
+          { echo "## ${{ matrix.channel }} -> ${{ steps.bump.outputs.sdk }}"
+            echo '```diff'; git --no-pager diff; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Push and open the PR
+        if: >-
+          steps.gate.outputs.skip == 'false' &&
+          steps.probe.outputs.stale == 'true' &&
+          steps.exists.outputs.exists == 'false' &&
+          inputs.dry_run != true
+        working-directory: feedstock
+        env:
+          GH_TOKEN: ${{ secrets.FEEDSTOCK_TOKEN }}
+          SDK: ${{ steps.bump.outputs.sdk }}
+          RUNTIME: ${{ steps.bump.outputs.runtime }}
+          SECURITY: ${{ steps.bump.outputs.security }}
+          BRANCH: ${{ steps.bump.outputs.branch }}
+        run: |
+          git config user.name  "dotnet-autobump"
+          git config user.email "noreply@github.com"
+          git checkout -q -b "$BRANCH"
+          git add recipe/meta.yaml
+          git commit -q -m "$SDK / runtime $RUNTIME"
+          git push -q origin "$BRANCH"
+
+          title="$SDK / runtime $RUNTIME"
+          [ "$SECURITY" = "true" ] && title="$title (security release)"
+
+          python3 ../scripts/render_pr_body.py ../summary.json > ../body.md
+          url=$(gh pr create \
+            --repo conda-forge/dotnet-feedstock \
+            --head "acesnik:$BRANCH" \
+            --base main \
+            --title "$title" \
+            --body-file ../body.md)
+          echo "opened $url"
+          echo "$url" >> "$GITHUB_STEP_SUMMARY"
+
+          # Ask conda-forge's bot to rerender, so the PR arrives CI-complete
+          # instead of waiting on a human.
+          #
+          # This must be a COMMENT, not part of the PR body. conda-forge's docs
+          # describe the trigger as a comment on the PR (which rerenders that
+          # PR's head branch and pushes a commit to it) or an issue title/comment
+          # (which opens a separate PR). Nothing documents the PR description as
+          # a trigger, so putting it there would be a guess.
+          #
+          # Doing this automatically means a rerender's diff lands without review
+          # -- which can be large when a feedstock's rendering is stale. That is
+          # the tradeoff for hands-off PRs; drop this step if you would rather
+          # inspect first.
+          gh pr comment "$url" --body "@conda-forge-admin, please rerender"
+          echo "requested rerender"
