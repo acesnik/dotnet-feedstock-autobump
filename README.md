@@ -27,7 +27,13 @@ deciding:
 | A tracked line reaches EOL below its final version | **issue** |
 | Microsoft starts publishing a new architecture | **issue** |
 | Microsoft *drops* an architecture we package | **issue** (impending breakage) |
+| A preview line exists, or a line is skipped by policy | **notice** in the run summary |
 | Nothing changed | a table in the run summary |
+
+Notices are the third category, and they exist because silence was this
+workflow's original sin. A hardcoded channel list would have let .NET 11 and 12
+ship unremarked. A notice opens nothing and costs one line, but it makes
+"we saw it and chose not to act" distinguishable from "we never looked".
 
 ## Multiple lines, not just the newest
 
@@ -57,6 +63,31 @@ while Microsoft still lists it as `maintenance`. That is the specific failure th
 EOL lines (`v3`, `v5`, `v6`, `v7`) are deliberately not watched. Each already
 sits at its line's final release, and Microsoft will publish no more, so there is
 nothing to detect.
+
+### Previews are detected but never packaged
+
+11.0 is in preview, and the bot reports it as a notice while refusing to act. Two
+independent reasons, both verified rather than assumed:
+
+```
+conda-build:  Bad character(s) (-) in package/version: 11.0.100-preview.6.26359.118
+ordering:     10.0.302  <  11.0.100-preview.6.26359.118  <  11.0.100
+```
+
+conda package filenames are `name-version-build`, so a hyphen in a version is
+structurally ambiguous and conda-build rejects it — and every Microsoft preview
+SDK string contains one. Worse, even with the version mangled to make it build, a
+preview **outranks stable**: publishing it would make `conda install dotnet`
+resolve to a preview instead of the 10.0 LTS.
+
+So adding a preview line to `tracked` doesn't silently start opening broken PRs —
+it escalates with that explanation. There's also a general guard: any tracked
+line whose upstream version isn't a valid conda version escalates rather than
+producing a PR that cannot build, so an unexpected `-rc.1` is caught the same way.
+
+Shipping previews at all would need a deliberate scheme — a mangled version *and*
+a separate package name or channel label — which is a design decision, not a
+version bump.
 
 The thing it will never do is go quiet. An earlier version of this workflow
 hardcoded `matrix: channel: ["10.0"]`, which meant .NET 11 and 12 could ship

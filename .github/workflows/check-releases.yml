@@ -92,6 +92,13 @@ jobs:
           print(f"- offered but not packaged:\n")
           for s in p["rids"]["skipped"]:
               print(f"  - `{s['rid']}` — {s['reason']}")
+          notes = p.get("notices", [])
+          if notes:
+              # Seen-and-deliberately-skipped, so it is distinguishable from
+              # never-looked. Notices never open anything.
+              print(f"\n### Noted, no action\n")
+              for n in notes:
+                  print(f"- {n}")
           iss = p.get("issues", [])
           print(f"\n### Escalations: {len(iss)}\n")
           for i in iss:

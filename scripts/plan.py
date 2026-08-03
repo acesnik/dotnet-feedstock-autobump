@@ -137,12 +137,27 @@ def ckey(ch: str):
     return [int(x) if x.isdigit() else 0 for x in ch.split(".")]
 
 
+def conda_version_problem(v: str) -> str | None:
+    """Why conda-build would reject this as a package version, if it would.
+
+    Microsoft's preview SDKs are named like `11.0.100-preview.6.26359.118`, and
+    conda-build rejects that outright: `Bad character(s) (-) in package/version`.
+    Package filenames are `name-version-build`, so a hyphen in the version is
+    structurally ambiguous. Guarding here means a preview line added to `tracked`
+    escalates with an explanation instead of opening a PR that cannot build.
+    """
+    bad = [c for c in "-!/ " if c in v]
+    if bad:
+        return f"conda-build rejects {''.join(sorted(set(bad)))!r} in a package version"
+    return None
+
+
 def plan_lines(cfg, channels, repo: Path):
     """Per-line bumps, plus escalations about which lines exist at all."""
     tracked: dict[str, str] = cfg.get("tracked", {})
     policy = cfg.get("policy", "manual")
     by_ch = {c["channel"]: c for c in channels}
-    bumps, issues, lines = [], [], []
+    bumps, issues, lines, notices = [], [], [], []
 
     newest_tracked = max(tracked, key=ckey) if tracked else None
 
@@ -211,8 +226,59 @@ def plan_lines(cfg, channels, repo: Path):
                 )
             continue
 
-        if entry["stale"]:
-            bumps.append(entry)
+        if not entry["stale"]:
+            continue
+
+        # A preview line must never be bumped automatically. Two independent
+        # reasons, both verified: conda-build refuses a hyphenated version, and
+        # even mangled it would outrank stable (10.0.302 < 11.0.100-preview.6),
+        # so `conda install dotnet` would resolve to a preview.
+        if phase == "preview":
+            issues.append(
+                {
+                    "key": f"preview-tracked-{ch}",
+                    "title": f".NET {ch} is tracked but is still a preview -- refusing to bump",
+                    "body": (
+                        f"`channels.json` tracks **{ch}** on `{branch}`, but "
+                        f"Microsoft lists it as `preview` with SDK "
+                        f"`{info['latest_sdk']}`. No PR was opened, for two "
+                        "reasons:\n\n"
+                        "1. conda-build rejects the version outright — "
+                        "`Bad character(s) (-) in package/version`. Package "
+                        "filenames are `name-version-build`, so a hyphen in a "
+                        "version is ambiguous, and every Microsoft preview SDK "
+                        "string contains one.\n"
+                        f"2. Even with the version mangled, a preview sorts above "
+                        f"stable: `10.0.302 < {info['latest_sdk']}`. Publishing it "
+                        "would make `conda install dotnet` resolve to a preview "
+                        "build.\n\n"
+                        "Shipping previews would need a deliberate scheme — a "
+                        "mangled version *and* a separate package name or channel "
+                        f"label — not a version bump. Remove {ch} from `tracked` "
+                        "until it reaches `active`."
+                    ),
+                }
+            )
+            continue
+
+        problem = conda_version_problem(info["latest_sdk"])
+        if problem:
+            issues.append(
+                {
+                    "key": f"unpackageable-version-{ch}-{info['latest_sdk']}",
+                    "title": f".NET {ch} latest SDK `{info['latest_sdk']}` is not a valid conda version",
+                    "body": (
+                        f"Line **{ch}** has `{info['latest_sdk']}` upstream, but "
+                        f"{problem}. No PR was opened; it could not build.\n\n"
+                        "This guard is deliberately general rather than a "
+                        "preview-only check, so any unexpected version string "
+                        "escalates instead of producing a broken PR."
+                    ),
+                }
+            )
+            continue
+
+        bumps.append(entry)
 
     # Lines Microsoft still supports that we don't track at all.
     for ch, info in sorted(by_ch.items(), key=lambda kv: ckey(kv[0])):
@@ -242,14 +308,40 @@ def plan_lines(cfg, channels, repo: Path):
         )
 
     # Newer-than-tracked candidate lines, judged against declared policy.
-    if policy != "manual" and newest_tracked:
+    #
+    # Anything not escalated here still produces a NOTICE. Silence was the
+    # original sin of this workflow -- a hardcoded channel list that would let
+    # .NET 11 and 12 ship unremarked. A notice costs a line in the run summary
+    # and never opens anything, but it means "we saw it and chose not to act" is
+    # visible rather than indistinguishable from "we never looked".
+    if newest_tracked:
         for ch, info in sorted(by_ch.items(), key=lambda kv: ckey(kv[0])):
             if ckey(ch) <= ckey(newest_tracked) or ch in tracked:
                 continue
-            if info["support_phase"] != "active":
-                continue  # never propose shipping a preview
-            if policy == "lts" and info["release_type"] != "lts":
-                continue  # declared policy already answers this
+            phase, rtype = info["support_phase"], info["release_type"]
+
+            if phase == "preview":
+                notices.append(
+                    f"{ch} is in preview ({rtype}, SDK {info['latest_sdk']}) — "
+                    "not packageable: conda-build rejects the hyphen in the "
+                    "version, and a preview would outrank stable anyway"
+                )
+                continue
+            if phase != "active":
+                notices.append(f"{ch} is {phase} ({rtype}) — not tracked, no action")
+                continue
+            if policy == "manual":
+                notices.append(
+                    f"{ch} is active ({rtype}) — policy is `manual`, so not escalated"
+                )
+                continue
+            if policy == "lts" and rtype != "lts":
+                notices.append(
+                    f"{ch} went active as {rtype.upper()} (SDK "
+                    f"{info['latest_sdk']}) — policy is `lts`, so no adoption "
+                    "proposed. Change `policy` to `latest` if you want STS lines."
+                )
+                continue
             issues.append(
                 {
                     "key": f"new-channel-{ch}",
@@ -274,7 +366,7 @@ def plan_lines(cfg, channels, repo: Path):
                     ),
                 }
             )
-    return bumps, issues, lines
+    return bumps, issues, lines, notices
 
 
 def plan_rids(cfg, offered, packaged):
@@ -373,7 +465,7 @@ def main(argv: list[str]) -> int:
         for e in raw
     ]
 
-    bumps, issues, lines = plan_lines(cfg, channels, repo)
+    bumps, issues, lines, notices = plan_lines(cfg, channels, repo)
 
     # Architectures are audited once, against the newest tracked line: the RID
     # set is a property of .NET, not of a patch release.
@@ -403,6 +495,7 @@ def main(argv: list[str]) -> int:
                 "policy": cfg.get("policy"),
                 "issue_repo": cfg.get("issue_repo"),
                 "lines": lines,
+                "notices": notices,
                 "bumps": bumps,
                 "rids": {
                     "offered": offered,
