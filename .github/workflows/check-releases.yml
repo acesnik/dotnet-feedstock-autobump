@@ -42,6 +42,8 @@ jobs:
       bump_count: ${{ steps.plan.outputs.bump_count }}
       issue_count: ${{ steps.plan.outputs.issue_count }}
       issue_repo: ${{ steps.plan.outputs.issue_repo }}
+      transition: ${{ steps.plan.outputs.transition }}
+      has_transition: ${{ steps.plan.outputs.has_transition }}
     steps:
       - uses: actions/checkout@v7
 
@@ -73,6 +75,9 @@ jobs:
           print(f"bump_count={len(bumps)}")
           print(f"issue_count={len(p.get('issues', []))}")
           print(f"issue_repo={p.get('issue_repo','')}")
+          tr = p.get("transition")
+          print("transition=" + json.dumps(tr or {}, separators=(",", ":")))
+          print(f"has_transition={'true' if tr else 'false'}")
           PY
           # Human-readable rundown in the run summary, so a quiet week is still
           # legible rather than just a green tick.
@@ -92,6 +97,14 @@ jobs:
           print(f"- offered but not packaged:\n")
           for s in p["rids"]["skipped"]:
               print(f"  - `{s['rid']}` — {s['reason']}")
+          tr = p.get("transition")
+          if tr:
+              print(f"\n### Line transition proposed\n")
+              print(f"- **{tr['to_channel']}** ({tr['to_release_type'].upper()}, "
+                    f"SDK `{tr['to_sdk']}`) has reached GA")
+              print(f"- cut `{tr['cut_branch']}` from `{tr['from_branch']}` so "
+                    f"{tr['from_channel']} stays patchable, then move "
+                    f"`{tr['from_branch']}` to {tr['to_channel']}")
           notes = p.get("notices", [])
           if notes:
               # Seen-and-deliberately-skipped, so it is distinguishable from
@@ -274,3 +287,184 @@ jobs:
               print(out.stdout.strip() or out.stderr.strip())
           print(f"filed {len(todo)} issue(s)")
           PY
+
+  transition:
+    needs: plan
+    if: needs.plan.outputs.has_transition == 'true' && inputs.dry_run != true
+    runs-on: ubuntu-latest
+    env:
+      TR: ${{ needs.plan.outputs.transition }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Unpack the transition
+        id: tr
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          t = json.loads(os.environ["TR"])
+          for k in ("to_channel","to_sdk","to_release_type","from_channel",
+                    "from_branch","cut_branch"):
+              print(f"{k}={t[k]}")
+          print(f"cut_upstream={str(t['cut_branch_upstream']).lower()}")
+          PY
+
+      # Step 1 of 3: preserve the outgoing line. This is the only action here not
+      # mediated by a PR, because a ref cannot be created by one. It is additive --
+      # a new ref at main's current tip, never a force-update -- and it aborts if
+      # the branch already exists. Skipping this is how 9.0 got orphaned: it
+      # shipped from main, 10.0 took over, and no v9 branch was ever cut.
+      - name: Cut ${{ steps.tr.outputs.cut_branch }} to keep ${{ steps.tr.outputs.from_channel }} patchable
+        id: cut
+        env:
+          GH_TOKEN: ${{ secrets.FEEDSTOCK_TOKEN }}
+        run: |
+          set -euo pipefail
+          CUT='${{ steps.tr.outputs.cut_branch }}'
+          FROM='${{ steps.tr.outputs.from_branch }}'
+          TARGET_REPO='${{ env.UPSTREAM }}'
+          [ '${{ steps.tr.outputs.cut_upstream }}' = 'true' ] || TARGET_REPO='${{ env.FEEDSTOCK }}'
+
+          if gh api "repos/$TARGET_REPO/git/ref/heads/$CUT" >/dev/null 2>&1; then
+            echo "::warning::$CUT already exists on $TARGET_REPO - not touching it"
+            echo "cut=existed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Always cut from UPSTREAM's tip, even when pushing the ref to the fork:
+          # the fork may lag, and the point is to snapshot what main ships now.
+          SHA=$(gh api "repos/${{ env.UPSTREAM }}/git/ref/heads/$FROM" --jq .object.sha)
+          echo "cutting $CUT from ${{ env.UPSTREAM }}@$FROM ($SHA) on $TARGET_REPO"
+          gh api -X POST "repos/$TARGET_REPO/git/refs" \
+            -f ref="refs/heads/$CUT" -f sha="$SHA" >/dev/null
+          echo "cut=created" >> "$GITHUB_OUTPUT"
+          echo "repo=$TARGET_REPO" >> "$GITHUB_OUTPUT"
+          { echo "### Cut \`$CUT\`"; echo;
+            echo "From \`${{ env.UPSTREAM }}@$FROM\` at \`$SHA\`, on \`$TARGET_REPO\`.";
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Step 2 of 3: move the primary line. An ordinary PR, so a human merges it.
+      - name: Check out the feedstock fork
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ env.FEEDSTOCK }}
+          path: feedstock
+          token: ${{ secrets.FEEDSTOCK_TOKEN }}
+          fetch-depth: 0
+
+      - name: Open the ${{ steps.tr.outputs.to_channel }} PR against ${{ steps.tr.outputs.from_branch }}
+        env:
+          GH_TOKEN: ${{ secrets.FEEDSTOCK_TOKEN }}
+          TO_CH: ${{ steps.tr.outputs.to_channel }}
+          FROM_BR: ${{ steps.tr.outputs.from_branch }}
+          CUT: ${{ steps.tr.outputs.cut_branch }}
+          FROM_CH: ${{ steps.tr.outputs.from_channel }}
+          CUT_STATE: ${{ steps.cut.outputs.cut }}
+        working-directory: feedstock
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${{ env.UPSTREAM }}.git"
+          git fetch -q upstream "$FROM_BR"
+          git checkout -q -B "ci-transition" "upstream/$FROM_BR"
+
+          python3 ../scripts/update-dotnet-version.py \
+            --channel "$TO_CH" --write --summary-json ../summary.json
+          SDK=$(python3 -c "import json;print(json.load(open('../summary.json'))['sdk_version'])")
+          BR="autobump/$SDK"
+
+          if git ls-remote --exit-code --heads origin "$BR" >/dev/null 2>&1; then
+            echo "::notice::$BR exists already - stopping"; exit 0
+          fi
+
+          git config user.name  "dotnet-autobump"
+          git config user.email "noreply@github.com"
+          git checkout -q -b "$BR"
+          git add recipe/meta.yaml
+          git commit -q -m "$TO_CH: move to $SDK"
+          git push -q origin "$BR"
+
+          python3 ../scripts/render_pr_body.py ../summary.json > ../body.md
+          {
+            echo
+            echo "---"
+            echo
+            echo "### This moves the primary line from $FROM_CH to $TO_CH"
+            echo
+            if [ "$CUT_STATE" = "created" ]; then
+              echo "\`$CUT\` has been cut from \`$FROM_BR\`, so **$FROM_CH stays"
+              echo "patchable** and keeps receiving security updates. Add"
+              echo "\`\"$FROM_CH\": \"$CUT\"\` to \`channels.json\` in the autobump repo"
+              echo "(a PR for that follows) so it is bumped from now on."
+            elif [ "$CUT_STATE" = "existed" ]; then
+              echo "\`$CUT\` already existed and was left untouched."
+            fi
+            echo
+            echo "Verified mechanical: rendering this recipe at the new version needs"
+            echo "no edits beyond the two version variables, because \`framework\`"
+            echo "derives the target framework and the metapackage pins follow"
+            echo "\`runtime_version\`."
+          } >> ../body.md
+
+          url=$(gh pr create --repo "${{ env.UPSTREAM }}" \
+                  --head "${FEEDSTOCK%%/*}:$BR" --base "$FROM_BR" \
+                  --title "$TO_CH: move primary line to $SDK" \
+                  --body-file ../body.md)
+          echo "opened $url"
+          echo "$url" >> "$GITHUB_STEP_SUMMARY"
+          gh pr comment "$url" --body "@conda-forge-admin, please rerender"
+
+      # Step 3 of 3: keep the declared policy honest. channels.json is
+      # human-owned, so this is a PR against this repo rather than a direct edit.
+      - name: PR channels.json so tracked reflects the new layout
+        if: steps.cut.outputs.cut == 'created'
+        env:
+          GH_TOKEN: ${{ secrets.FEEDSTOCK_TOKEN }}
+          FROM_CH: ${{ steps.tr.outputs.from_channel }}
+          TO_CH: ${{ steps.tr.outputs.to_channel }}
+          CUT: ${{ steps.tr.outputs.cut_branch }}
+          FROM_BR: ${{ steps.tr.outputs.from_branch }}
+        run: |
+          set -euo pipefail
+          BR="tracked/$TO_CH"
+          git ls-remote --exit-code --heads origin "$BR" >/dev/null 2>&1 && {
+            echo "::notice::$BR exists already"; exit 0; }
+          python3 - <<'PY'
+          import json, os, re
+          from pathlib import Path
+          p = Path("channels.json"); t = p.read_text()
+          frm, to, cut, frmbr = (os.environ[k] for k in
+                                 ("FROM_CH","TO_CH","CUT","FROM_BR"))
+          # Textual edit, not a json round-trip: channels.json carries _comment
+          # keys and formatting that document every decision, and rewriting it
+          # programmatically would strip all of that.
+          old = re.search(r'"tracked":\s*\{[^}]*\}', t).group(0)
+          entries = re.findall(r'"([\d.]+)":\s*"([^"]+)"', old)
+          m = {c: b for c, b in entries}
+          m[frm] = cut
+          m[to] = frmbr
+          body = ",\n".join(
+              f'    "{c}": "{m[c]}"'
+              for c in sorted(m, key=lambda x: [int(i) for i in x.split(".")],
+                              reverse=True))
+          p.write_text(t.replace(old, '"tracked": {\n' + body + "\n  }"))
+          print(json.dumps(m, indent=2))
+          PY
+          git config user.name  "dotnet-autobump"
+          git config user.email "noreply@github.com"
+          git checkout -q -b "$BR"
+          git add channels.json
+          git commit -q -m "tracked: $TO_CH takes $FROM_BR, $FROM_CH moves to $CUT"
+          git push -q origin "$BR"
+          # Body via a file: an inline multi-line --body dedents out of the YAML
+          # block scalar and breaks the workflow parse.
+          cat > ../tracked-body.md <<EOF
+          Follows the line transition. \`$CUT\` was cut from \`$FROM_BR\`, so
+          $FROM_CH is bumped from there now, and $TO_CH takes over \`$FROM_BR\`.
+
+          Merge after the feedstock PR lands, so the plan does not propose a
+          $TO_CH bump against a branch that still ships $FROM_CH.
+          EOF
+          sed -i 's/^          //' ../tracked-body.md
+          gh pr create --repo "${{ github.repository }}" --head "$BR" --base main \
+            --title "tracked: $TO_CH on $FROM_BR, $FROM_CH on $CUT" \
+            --body-file ../tracked-body.md

@@ -27,6 +27,7 @@ deciding:
 | A tracked line reaches EOL below its final version | **issue** |
 | Microsoft starts publishing a new architecture | **issue** |
 | Microsoft *drops* an architecture we package | **issue** (impending breakage) |
+| A line leaves preview and should take over `main` | **transition**: cut `vN`, then PR |
 | A preview line exists, or a line is skipped by policy | **notice** in the run summary |
 | Nothing changed | a table in the run summary |
 
@@ -88,6 +89,40 @@ producing a PR that cannot build, so an unexpected `-rc.1` is caught the same wa
 Shipping previews at all would need a deliberate scheme — a mangled version *and*
 a separate package name or channel label — which is a design decision, not a
 version bump.
+
+## The line transition, automated
+
+When a line leaves preview, the convention is: cut a `vN` branch from `main` so
+the outgoing line stays patchable, then move `main` to the new line. Skipping the
+first half is exactly how 9.0 got orphaned, so the bot does it.
+
+Three actions, two of them ordinary reviewable PRs:
+
+1. **Cut `vN` from `main`'s current tip.** The one action not mediated by a PR,
+   because a ref cannot be created by one. Additive only — a new ref, never a
+   force-update — and it aborts if the branch already exists. Set
+   `transition.cut_branch_upstream: false` to have it pushed to the fork instead,
+   leaving you one `git push upstream vN`.
+2. **PR `main` → the new line**, then request a rerender by comment.
+3. **PR this repo's `channels.json`** so `tracked` reflects the new layout
+   (`10.0` moves to `v10`, `11.0` takes `main`). A PR rather than a direct edit,
+   because that file is human-owned. The edit is textual, not a JSON round-trip,
+   so the `_comment` keys documenting every decision survive.
+
+This is safe to automate because the move is mechanical — verified by rendering
+the recipe at `11.0.100`, which needs no edits beyond the two version variables:
+`framework` derives `net11.0` for the test paths and the metapackage pins follow
+`runtime_version`.
+
+One interaction handled explicitly: if the outgoing line is *also* stale, its
+bump is **deferred** rather than opened, because both PRs would target `main` and
+conflict. Its patches belong on the new `vN` branch, which the next run picks up
+once `tracked` maps it there — self-healing rather than order-dependent.
+
+The planner also warns when a `vN` branch's recipe carries a different line's
+version, which catches a branch cut from the wrong commit. That is a notice, not
+an issue: it is often benign, since the recipe is version-agnostic and a branch
+cut from a newer `main` inherits newer rerender infrastructure.
 
 The thing it will never do is go quiet. An earlier version of this workflow
 hardcoded `matrix: channel: ["10.0"]`, which meant .NET 11 and 12 could ship

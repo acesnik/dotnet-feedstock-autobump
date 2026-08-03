@@ -158,6 +158,8 @@ def plan_lines(cfg, channels, repo: Path):
     policy = cfg.get("policy", "manual")
     by_ch = {c["channel"]: c for c in channels}
     bumps, issues, lines, notices = [], [], [], []
+    transition = None
+    transition_cfg = cfg.get("transition", {})
 
     newest_tracked = max(tracked, key=ckey) if tracked else None
 
@@ -192,6 +194,20 @@ def plan_lines(cfg, channels, repo: Path):
                 }
             )
             continue
+
+        # A vN branch whose recipe carries a different line's version was almost
+        # certainly cut from the wrong commit -- e.g. branching v9 off a main that
+        # had already moved to 10.0. A notice rather than an issue, because it is
+        # often benign: the recipe is version-agnostic (`framework` derives from
+        # sdk_version), so the bump still produces a correct package, and a branch
+        # cut from a newer main inherits newer rerender infrastructure.
+        if cur_sdk != "?" and not cur_sdk.startswith(ch.split(".")[0] + "."):
+            notices.append(
+                f"`{branch}` is tracked for {ch} but its recipe says {cur_sdk} — "
+                f"cut from a {'.'.join(cur_sdk.split('.')[:2])} commit. Harmless "
+                "if intentional (the recipe is version-agnostic), but check it is "
+                "not the wrong branch."
+            )
 
         phase = info["support_phase"]
         entry = {
@@ -342,6 +358,37 @@ def plan_lines(cfg, channels, repo: Path):
                     "proposed. Change `policy` to `latest` if you want STS lines."
                 )
                 continue
+
+            # This line reached GA and policy says adopt it. If the outgoing
+            # line lives on `main`, the transition is mechanical: cut a vN branch
+            # so it stays patchable, then move `main`. Emit it as a structured
+            # transition rather than an issue -- it is actionable, and leaving it
+            # as prose is how 9.0 ended up orphaned.
+            out_ch = newest_tracked
+            out_branch = tracked[out_ch]
+            cut = "v" + out_ch.split(".")[0]
+            problem = conda_version_problem(info["latest_sdk"])
+            if transition_cfg.get("enabled") and out_branch == "main" and not problem:
+                if git_show(repo, cut, "recipe/meta.yaml") is not None:
+                    notices.append(
+                        f"{ch} is GA and would take over `main`, but branch "
+                        f"`{cut}` already exists — not proposing a transition. "
+                        f"Add `\"{out_ch}\": \"{cut}\"` to `tracked` if that "
+                        "branch is the outgoing line."
+                    )
+                    continue
+                transition = {
+                    "to_channel": ch,
+                    "to_sdk": info["latest_sdk"],
+                    "to_release_type": rtype,
+                    "from_channel": out_ch,
+                    "from_branch": out_branch,
+                    "cut_branch": cut,
+                    "cut_branch_upstream": bool(
+                        transition_cfg.get("cut_branch_upstream")
+                    ),
+                }
+                continue
             issues.append(
                 {
                     "key": f"new-channel-{ch}",
@@ -366,7 +413,25 @@ def plan_lines(cfg, channels, repo: Path):
                     ),
                 }
             )
-    return bumps, issues, lines, notices
+    # If a transition is pending, drop the outgoing line's bump. Both would
+    # target the same branch -- the bump moving `main` to 10.0.302 while the
+    # transition moves it to 11.0.100 -- and the PRs would conflict. The
+    # outgoing line's patches belong on its new vN branch, which the next run
+    # picks up once `tracked` maps it there. Self-healing rather than ordered.
+    if transition:
+        dropped = [b for b in bumps if b["channel"] == transition["from_channel"]]
+        if dropped:
+            bumps = [b for b in bumps if b["channel"] != transition["from_channel"]]
+            d = dropped[0]
+            notices.append(
+                f"Deferred the {d['channel']} bump ({d['current_sdk']} → "
+                f"{d['latest_sdk']}): a transition to {transition['to_channel']} "
+                f"is pending on the same branch. It will be proposed against "
+                f"`{transition['cut_branch']}` once that branch exists and is "
+                "tracked."
+            )
+
+    return bumps, issues, lines, notices, transition
 
 
 def plan_rids(cfg, offered, packaged):
@@ -465,7 +530,7 @@ def main(argv: list[str]) -> int:
         for e in raw
     ]
 
-    bumps, issues, lines, notices = plan_lines(cfg, channels, repo)
+    bumps, issues, lines, notices, transition = plan_lines(cfg, channels, repo)
 
     # Architectures are audited once, against the newest tracked line: the RID
     # set is a property of .NET, not of a patch release.
@@ -496,6 +561,7 @@ def main(argv: list[str]) -> int:
                 "issue_repo": cfg.get("issue_repo"),
                 "lines": lines,
                 "notices": notices,
+                "transition": transition,
                 "bumps": bumps,
                 "rids": {
                     "offered": offered,

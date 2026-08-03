@@ -31,23 +31,52 @@
   ],
   "tracked": {
     "10.0": "main",
+    "9.0": "v9",
     "8.0": "v8"
   },
 
   "_policy_comment": [
-    "What we WANT to track, used to judge whether a NEWER channel than anything",
-    "in `tracked` is worth escalating:",
-    "  lts    - only Long Term Support lines (3 yr). 10.0 is LTS, 11.0 is STS.",
-    "  latest - newest active line regardless of support type.",
-    "  manual - never escalate; only bump what is already in `tracked`.",
+    "Which NEWER-than-tracked lines we adopt:",
+    "  latest - any line that leaves preview (reaches GA), LTS or STS alike.",
+    "  lts    - only Long Term Support lines. LTS is 3 years of support and lands",
+    "           on even majors (8, 10, 12); STS is 18 months, odd majors",
+    "           (7, 9, 11). Both reach GA the same way -- the difference is only",
+    "           how long Microsoft supports them.",
+    "  manual - never adopt; only bump what is already in `tracked`.",
     "",
-    "Separately, and regardless of policy: a line that is still supported",
-    "(active or maintenance) but absent from `tracked` gets escalated as a",
-    "maintenance gap. 9.0 is exactly that today -- it was published as 9.0.203",
-    "from main, then 10.0 replaced it and no v9 branch was ever cut, so it is",
-    "orphaned nine patch releases behind with no branch to update it from."
+    "`latest` is set because it matches what this feedstock has always done:",
+    "conda-forge published 7.0.410 and 9.0.203, both STS lines, and each held",
+    "`main` in its turn (upstream still has the v7 branch from when 7.0 handed",
+    "over). Following every release is cheap here precisely because several lines",
+    "are maintained at once -- moving `main` to 11.0 does not take 10.0 away,",
+    "since v10 keeps receiving patches and users can pin `dotnet=10`.",
+    "",
+    "Separately, and regardless of policy: a line still supported (active or",
+    "maintenance) but absent from `tracked` is escalated as a maintenance gap.",
+    "9.0 is exactly that today -- published as 9.0.203 from main, then 10.0",
+    "replaced it and no v9 branch was ever cut, so it sits orphaned nine patch",
+    "releases behind with nowhere to patch from. Automating the transition below",
+    "is what stops that recurring."
   ],
-  "policy": "lts",
+  "policy": "latest",
+
+  "_transition_comment": [
+    "When a newer line reaches GA, the convention is: cut a vN branch from",
+    "`main` so the outgoing line stays patchable, then move `main` to the new",
+    "line. Verified mechanical -- rendering the recipe at 11.0.100 needs no edits",
+    "beyond the two version variables, because `framework` derives net11.0 and",
+    "the metapackage pins follow runtime_version.",
+    "",
+    "cut_branch_upstream: create the vN ref directly on the upstream feedstock.",
+    "This is the one action not mediated by a PR, because a ref cannot be created",
+    "by one. It is non-destructive -- a new ref only, never a force-update, and",
+    "the job aborts if the branch already exists. Set false to have the branch",
+    "pushed to the fork instead, leaving you one `git push upstream vN` to run."
+  ],
+  "transition": {
+    "enabled": true,
+    "cut_branch_upstream": true
+  },
 
   "_issue_repo_comment": [
     "Where judgment-call issues get filed. Defaults to this repo rather than the",
