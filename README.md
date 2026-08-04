@@ -285,7 +285,15 @@ from the rewrite step, which is what makes the earlier ordering possible.
 
 The **notify** job files issues, deduplicating on a hidden `<!-- autobump-key:
 … -->` marker rather than the title, so retitling an issue by hand doesn't cause a
-duplicate next week.
+duplicate next week. Each finding is therefore filed **once, ever** — the lookup
+uses `--state all`, so a *closed* issue also suppresses re-filing. That is
+deliberate: closing one is a decision, and re-opening it weekly would be nagging.
+The tradeoff is that closing something by mistake suppresses it permanently, so
+reopen rather than close if you want it back.
+
+Most findings also self-resolve. `rid-available-win-arm64` disappears the moment
+`main`'s recipe packages win-arm64, because the audit reads the packaged set from
+the recipe rather than from config.
 
 Other behaviours worth knowing: **one branch per SDK version**
 (`autobump/10.0.302`), so re-runs are idempotent and a branch a human is working
