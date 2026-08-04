@@ -289,6 +289,32 @@ and the rerender is requested as a **PR comment**, because conda-forge documents
 the trigger as a comment (or an issue title/comment) and *not* as the PR
 description.
 
+### Rerenders are requested one at a time, after the matrix
+
+Not from inside the bump matrix. Two rerenders of the *same feedstock* at once
+collide: #118 and #119 had theirs requested 1 second apart, and one died with
+
+```
+OSError 39, 'Directory not empty'
+```
+
+inside conda-forge's rerender container while the other succeeded. Worth noting
+what was *not* the cause — the delay after PR creation was near-identical (19s vs
+17s), so waiting longer after opening the PR would not have helped. Concurrency
+was the variable.
+
+So a separate `rerender` job runs after the whole matrix and requests them
+sequentially with a gap. Since a rerender takes minutes, that reduces overlap
+rather than eliminating it — which is why the job is **stateless**: it finds open
+`autobump/` PRs carrying no `MNT: Re-rendered` commit, rather than being told what
+this run opened. Any PR whose rerender failed earlier gets picked up next run,
+instead of waiting for a human to notice. It only ever touches `autobump/`
+branches, so a human's PR is never poked.
+
+One implementation trap worth recording: asking `gh pr list` for `commits` across
+50 PRs exceeds GitHub's GraphQL node limit outright (505,050 > 500,000), so the
+query is two-stage — cheap fields to find candidates, then per-PR commit lookups.
+
 ## Setup
 
 ### 1. `FEEDSTOCK_TOKEN`

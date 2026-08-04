@@ -278,15 +278,11 @@ jobs:
           echo "opened $url"
           echo "$url" >> "$GITHUB_STEP_SUMMARY"
 
-          # Must be a COMMENT, not part of the PR body: conda-forge documents the
-          # trigger as a comment on the PR (rerenders the head branch and pushes
-          # a commit) or an issue title/comment. The description is not a
-          # documented trigger.
-          #
-          # Consequence: the rerender's diff lands without review, which can be
-          # large when a feedstock's rendering is stale. Drop this if you would
-          # rather inspect first.
-          gh pr comment "$url" --body "@conda-forge-admin, please rerender"
+          # Rerender is NOT requested here. It is requested by the `rerender`
+          # job, which runs after the whole matrix, because two rerenders of the
+          # same feedstock at once collide: requesting them 1 second apart for
+          # #118 and #119 made one fail with `OSError 39, Directory not empty`
+          # inside conda-forge's rerender container, while the other succeeded.
         # FEEDSTOCK is owner/repo; ${FEEDSTOCK%%/*} is the fork owner for --head.
 
   notify:
@@ -524,3 +520,64 @@ jobs:
           gh pr create --repo "${{ github.repository }}" --head "$BR" --base main \
             --title "tracked: $TO_CH on $FROM_BR, $FROM_CH on $CUT" \
             --body-file ../tracked-body.md
+
+  rerender:
+    # After the whole bump matrix, never inside it. Requesting a rerender for two
+    # PRs of the same feedstock simultaneously collides in conda-forge's rerender
+    # container -- observed on #118/#119, requested 1s apart: one succeeded, one
+    # died with `OSError 39, Directory not empty`. Note the delay after PR
+    # creation was near-identical (19s vs 17s), so waiting longer is not the fix;
+    # serialising is.
+    #
+    # Stateless on purpose: it finds open autobump PRs that have no rerender
+    # commit yet, rather than being told which ones this run opened. That makes it
+    # idempotent and self-healing -- a PR whose rerender failed in an earlier run
+    # gets picked up by the next one.
+    needs: [plan, bump]
+    if: always() && needs.bump.result == 'success' && inputs.dry_run != true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Request rerenders, one at a time
+        env:
+          GH_TOKEN: ${{ secrets.FEEDSTOCK_TOKEN }}
+        run: |
+          set -uo pipefail
+          # Two-stage query. Asking `gh pr list` for `commits` across 50 PRs
+          # exceeds GitHub's GraphQL node limit outright (505,050 > 500,000), so
+          # stage one uses cheap fields and stage two fetches commits per
+          # candidate.
+          if ! gh pr list --repo "${{ env.UPSTREAM }}" --state open --limit 100 \
+                 --json number,headRefName > prs.json; then
+            echo "::error::could not list open PRs"; exit 1
+          fi
+          mapfile -t cands < <(python3 scripts/needs_rerender.py --candidates < prs.json)
+          todo=()
+          for n in "${cands[@]:-}"; do
+            [ -n "$n" ] || continue
+            gh pr view "$n" --repo "${{ env.UPSTREAM }}" --json commits > "pr-$n.json"
+            if python3 scripts/needs_rerender.py --check < "pr-$n.json"; then
+              todo+=("$n")
+            else
+              echo "#$n already has a rerender commit"
+            fi
+          done
+          if [ "${#todo[@]}" -eq 0 ]; then
+            echo "::notice::no autobump PR is awaiting a rerender"
+            echo "No PR awaiting a rerender." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          first=1
+          for n in "${todo[@]}"; do
+            # Gap between requests so two rerenders of the same feedstock never
+            # run concurrently. conda-forge's rerender takes minutes, so this
+            # reduces overlap rather than eliminating it -- which is why the next
+            # run re-checks and re-requests anything still missing.
+            [ "$first" -eq 1 ] || sleep 180
+            first=0
+            echo "requesting rerender for #$n"
+            gh pr comment "$n" --repo "${{ env.UPSTREAM }}" \
+              --body "@conda-forge-admin, please rerender"
+            echo "- requested rerender for #$n" >> "$GITHUB_STEP_SUMMARY"
+          done
