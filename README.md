@@ -140,7 +140,7 @@ channel list is discovered every run and compared against declared policy.
 ## Why the generic autotick bot can't do this
 
 conda-forge's version bot handles most feedstocks. It can't handle this one, for
-two structural reasons rather than anything to do with Microsoft's download page:
+three structural reasons rather than anything to do with Microsoft's download page:
 
 1. **Two independent versions.** `sdk_version` and `runtime_version` are not the
    same number and drift apart within a release line — `10.0.302` ships with
@@ -148,6 +148,68 @@ two structural reasons rather than anything to do with Microsoft's download page
 2. **Six `sha256` values behind selectors.** The bot updates `sha256:` under
    `source:`; it has no path into
    `{% set sha256 = "..." %}  # [linux and aarch64]`.
+3. **A third fact is coupled to the version: the ABI floor.** Bumping .NET can
+   change the glibc version the artifact requires and the openssl sonames it can
+   load. Both are declared elsewhere in the recipe, neither is derivable from a
+   version string, and getting them wrong produces a package that *resolves and
+   installs* before failing. See below.
+
+## The ABI check: glibc and openssl
+
+The tool knew two version-coupled facts and verified one integrity fact (sha256,
+cross-checked against Microsoft's published sha512). The ABI floor is a third, and
+it had already drifted unnoticed:
+
+| | .NET 8 | .NET 9 | .NET 10 | .NET 11 preview.6 |
+|---|---|---|---|---|
+| glibc required | 2.17 | 2.17 | **2.27** | **2.27** |
+| openssl loadable | 1.1, 3 | 1.1, 3 | 1.1, 3 | 1.1, 3, **4** |
+
+Both numbers moved at a **major boundary**, and the recipe followed neither:
+
+- **glibc.** .NET 10 raised its floor to 2.27 while the recipe went on declaring
+  `c_stdlib_version: 2.17`, so conda-forge published `dotnet-runtime 10.0.x`
+  advertising `__glibc >=2.17,<3.0.a0` for the whole line. Those packages install
+  on hosts where the runtime cannot load — the failure lands at first use, not at
+  solve time. Found by running [`check-glibc`](https://github.com/conda-forge/cf-nvidia-tools-feedstock/blob/main/recipe/bin/check-glibc)
+  after @dhirschfeld pointed at it on conda-forge/dotnet-feedstock#55.
+- **openssl.** .NET's crypto shim `dlopen`s a hardcoded soname list. Through
+  .NET 10 it tops out at `libssl.so.3`, so openssl 4.x — which ships only
+  `libssl.so.4`, with no compatibility link — breaks every crypto call. That is
+  what `openssl <4` guards. .NET 11 *adds* `libssl.so.4`, so the same pin becomes
+  wrong in the opposite direction the moment 11 ships.
+
+`abi_probe.py` reads both from the artifact rather than from a table here, because
+a table is exactly what went stale. glibc comes from each object's
+`.gnu.version_r` section — the same information `check-glibc` derives from the
+symbol table, verified to agree on eight artifacts across four release lines.
+
+One trap worth knowing, because it makes the naive implementation silently wrong
+in the permissive direction: .NET 8's shim lists `libssl.so.10`, `libssl.so.11`
+and `libssl.so.111`. Those are **RedHat aliases** for the 1.0.x and 1.1.x series,
+not majors 10, 11 and 111. A numeric maximum over the soname list reports .NET 8
+as supporting "openssl 111", which would make `openssl <4` look satisfiable — the
+very pin that exists to stop openssl 4 being chosen. So the check maps each
+conda-forge openssl major onto the soname that major installs and asks whether the
+shim names it.
+
+Findings are **always escalated, never auto-fixed**. Raising `c_stdlib_version`
+drops every user below the new floor, and changing an openssl pin changes what
+resolves for everyone; neither is mechanical. A pin that is merely *stricter* than
+necessary is a notice, not an issue, as is a recipe whose `conda_build_config.yaml`
+has been fixed but whose `.ci_support` has not been rerendered yet — escalating
+that would file an issue against something already fixed.
+
+Cost is one ~30 MB runtime tarball per tracked line per Linux platform — six
+downloads, about 10 seconds. The *runtime* archive rather than the SDK's ~240 MB
+because all the native code is there: the aspnetcore shared framework and the sdk
+tree ship zero `.so` files, so only `dotnet-runtime` constrains anything. osx and
+win are not probed at all, since glibc and ELF sonames don't exist there.
+
+A failure in this check does **not** fail the run. Bumping is the primary function
+and the plan job gates every other job, so an ABI bug taking the whole bot down
+would be worse than a missed check — but the plan then carries a notice saying the
+check did not run, so its silence never reads as a clean bill of health.
 
 ## Why a separate repo
 
@@ -405,7 +467,23 @@ scripts/plan.py channels.json path/to/dotnet-feedstock | jq
 
 The checkout needs every tracked branch present as a ref (`fetch-depth: 0`);
 recipes are read with `git show <ref>:recipe/meta.yaml`, so nothing is checked
-out per line. It resolves refs across any remote name, not just `origin`.
+out per line. It resolves refs across any remote name, not just `origin` — and
+warns if several remotes offer the same branch at different commits, since it then
+has no way to know which one you meant.
+
+The ABI check takes the plan and merges its findings into it, so run it second:
+
+```bash
+scripts/plan.py channels.json path/to/dotnet-feedstock > plan.json
+scripts/abi_check.py channels.json path/to/dotnet-feedstock plan.json | jq '.abi'
+```
+
+Or inspect a single artifact directly, which needs no feedstock at all:
+
+```bash
+scripts/abi_probe.py --rid linux-x64 --runtime 10.0.10
+scripts/abi_probe.py https://builds.dotnet.microsoft.com/dotnet/Runtime/...tar.gz
+```
 
 Standard library only, deliberately — everything runs in a bare container with no
 `pip install` step.
@@ -413,8 +491,8 @@ Standard library only, deliberately — everything runs in a bare container with
 ## Tests
 
 ```bash
-pytest            # 54 offline tests, ~2.5s
-pytest -m live    # 9 tests against real upstream endpoints
+pytest            # 175 offline tests, ~5s
+pytest -m live    # 11 tests against real upstream endpoints
 ```
 
 The offline suite monkeypatches `fetch_json`, `repodata_size` and git, and an
@@ -435,6 +513,13 @@ was easy to get wrong:
   identical to success.
 - The audit reads `PLATFORMS` from the updater rather than config, which the suite
   asserts — that drift is the exact thing the audit exists to detect.
+- The ELF parser is exercised against a **real, hand-built ELF64 object** carrying
+  a `.gnu.version_r` section, not a recorded blob, so it fails on structure rather
+  than on a checksum. It also asserts a 32-bit object yields *nothing* — silently
+  misparsing one would produce a confident wrong floor, which is worse than no
+  answer given a wrong number already went unnoticed for a release line.
+- The RedHat-alias case is pinned by a test that asserts the naive numeric reading
+  really would return `111`, so the guard can't quietly stop guarding anything.
 
 The **live** suite exists because the offline one cannot catch the likeliest real
 breakage: Microsoft or anaconda.org changing a payload shape. Every offline test
@@ -463,6 +548,15 @@ per-commit, since a failure there is upstream's change, not yours.
   ref first, which let a stale *local* branch shadow the remote one and silently
   report upstream `v8` as `8.0.407` when it was at `8.0.408` — wrong data, no
   error, in a tool whose whole job is reading other people's branches.
+- **Ordering among *remotes* is still alphabetical**, which is only safe in CI.
+  A local clone with both a fork and upstream configured read `acesnik/main`
+  (stale at `10.0.100`) instead of upstream's `main` (`10.0.302`), which also made
+  the already-packaged `win-arm64` look missing. There is no reliable way to tell
+  which remote is authoritative without being told, so the plan now emits a
+  **notice naming the ref it actually read** whenever several remotes offer it at
+  different commits. CI checks out one repository, so this fires exactly in the
+  local dry run — the case where a maintainer is most likely to trust the output
+  and least likely to check.
 - **Duplicate detection matches a version on token boundaries**, not as a plain
   substring — `8.0.42` used to match a PR titled `8.0.423` and would have skipped
   a legitimate bump. It still errs toward skipping, since a false positive costs a
