@@ -63,6 +63,11 @@ RECIPE = """\
 {% set sha256 = "eeee000000000000000000000000000000000000000000000000000000000000" %}  # [win and x86_64]
 {% set sha256 = "ffff000000000000000000000000000000000000000000000000000000000000" %}  # [win and arm64]
 {% set platform = "linux-arm64" %}  # [linux and aarch64]
+{% set platform = "linux-x64" %}  # [linux and x86_64]
+{% set platform = "osx-arm64" %}  # [osx and arm64]
+{% set platform = "osx-x64" %}  # [osx and x86_64]
+{% set platform = "win-x64" %}  # [win and x86_64]
+{% set platform = "win-arm64" %}  # [win and arm64]
 
 package:
   name: dotnet
@@ -71,6 +76,45 @@ package:
 build:
   number: 3
 """
+
+
+# The pre-win-arm64 shape: five platforms, and a BARE `# [win]` rather than
+# `# [win and x86_64]`. This is what upstream v8 and v9 actually carry, and the
+# absence of such a fixture is why 54 tests passed while the updater was 100%
+# broken for its stated purpose -- every other fixture used the newest shape.
+RECIPE_OLD_SHAPE = """\
+{% set sdk_version = "8.0.408" %}
+{% set runtime_version = "8.0.15" %}
+{% set framework = '.'.join(sdk_version.split('.')[:2]) %}
+{% set sha256 = "aaaa000000000000000000000000000000000000000000000000000000000000" %}  # [linux and aarch64]
+{% set sha256 = "bbbb000000000000000000000000000000000000000000000000000000000000" %}  # [linux and x86_64]
+{% set sha256 = "cccc000000000000000000000000000000000000000000000000000000000000" %}  # [osx and arm64]
+{% set sha256 = "dddd000000000000000000000000000000000000000000000000000000000000" %}  # [osx and x86_64]
+{% set sha256 = "eeee000000000000000000000000000000000000000000000000000000000000" %}  # [win]
+{% set platform = "linux-arm64" %}  # [linux and aarch64]
+{% set platform = "linux-x64" %}  # [linux and x86_64]
+{% set platform = "osx-arm64" %}  # [osx and arm64]
+{% set platform = "osx-x64" %}  # [osx and x86_64]
+{% set platform = "win-x64" %}  # [win]
+{% set ext = "tar.gz" %}  # [not win]
+{% set ext = "zip" %}  # [win]
+
+package:
+  name: dotnet
+  version: {{ sdk_version }}
+
+build:
+  number: 1
+"""
+
+
+@pytest.fixture
+def recipe_old_shape(tmp_path: Path) -> Path:
+    d = tmp_path / "old" / "recipe"
+    d.mkdir(parents=True)
+    f = d / "meta.yaml"
+    f.write_text(RECIPE_OLD_SHAPE)
+    return f
 
 
 @pytest.fixture

@@ -188,8 +188,31 @@ A still-supported line missing from `tracked` is escalated regardless of policy 
 that's a maintenance gap, not a preference.
 
 The set of RIDs the recipe *packages* is deliberately **not** listed here — it's
-read from `PLATFORMS` in `update-dotnet-version.py`, so the audit cannot drift
-out of sync with what the recipe actually does.
+read from the newest tracked branch's recipe, so the audit cannot drift out of
+sync with what the recipe actually does.
+
+### The recipe shape is discovered, not assumed
+
+Each branch carries whatever shape it was cut with. `main` has six platforms with
+`# [win and x86_64]`; a branch from before win-arm64 has five with a bare
+`# [win]`. So the updater reads the mapping out of the recipe's own lines:
+
+```jinja
+{% set platform = "linux-arm64" %}  # [linux and aarch64]
+{% set platform = "win-x64" %}      # [win]
+```
+
+This is not hypothetical tidiness. A hardcoded `PLATFORMS` list matched `main` and
+hard-failed on both `v8` and `v9` with `could not find the sha256 line for
+selector # [win and x86_64]` — the tool was 100% broken for the branches it was
+about to be pointed at, while every test passed, because every fixture used the
+newest shape. There is now an old-shape fixture.
+
+`PLATFORMS` survives only as a fallback for when no recipe is available.
+
+A recipe that *declares* a platform but has no `sha256` line for it still fails
+loudly — that is the recipe contradicting itself, as opposed to simply being an
+older shape.
 
 ### Two gates on architecture viability, and why both are needed
 
@@ -363,6 +386,10 @@ per-commit, since a failure there is upstream's change, not yours.
 - **`active_subdirs` is a manual list.** Nothing detects conda-forge adding or
   retiring a subdir, so a genuinely new platform stays invisible until someone
   updates it. The `win-32` case above is why it can't be inferred cheaply.
+- **`git_show` searches remotes before the bare ref.** It used to try the bare
+  ref first, which let a stale *local* branch shadow the remote one and silently
+  report upstream `v8` as `8.0.407` when it was at `8.0.408` — wrong data, no
+  error, in a tool whose whole job is reading other people's branches.
 - **A new RID needs recipe surgery, not just a hash.** The escalation issue spells
   this out, but the trap is real: adding an arch usually requires *narrowing* an
   existing broader selector, and forgetting to means silently shipping the wrong

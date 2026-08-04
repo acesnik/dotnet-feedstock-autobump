@@ -72,11 +72,17 @@ def strip_comments(obj):
 def git_show(repo: Path, ref: str, path: str) -> str | None:
     """Read a file at a ref without checking it out. None if the ref is absent.
 
-    Tries the bare ref, then the conventional remotes, then any remote at all --
-    a CI checkout names the remote `origin`, but a developer's clone of this
-    feedstock may well not (this one calls upstream `originDoNotPushHere`).
+    Remote-tracking refs are tried FIRST and the bare ref last. That ordering is
+    deliberate: trying the bare ref first let a stale *local* branch shadow the
+    remote one, which silently reported upstream v8 as 8.0.407 when it was
+    actually at 8.0.408 -- wrong data, no error, in a tool whose entire job is
+    reading other people's branches.
+
+    A CI checkout names the remote `origin`, but a developer's clone may not
+    (this feedstock's upstream is called `originDoNotPushHere`), so all remotes
+    are searched before falling back.
     """
-    candidates = [ref, f"origin/{ref}", f"upstream/{ref}"]
+    candidates = [f"origin/{ref}", f"upstream/{ref}"]
     remotes = subprocess.run(
         ["git", "-C", str(repo), "remote"], capture_output=True, text=True
     )
@@ -90,6 +96,8 @@ def git_show(repo: Path, ref: str, path: str) -> str | None:
     )
     if allrefs.returncode == 0:
         candidates += [r for r in allrefs.stdout.split() if r.endswith(f"/{ref}")]
+    # Bare ref last -- see the note above.
+    candidates.append(ref)
 
     seen = set()
     for candidate in candidates:
@@ -515,10 +523,19 @@ def main(argv: list[str]) -> int:
     repo = Path(argv[2])
 
     updater = load_updater()
-    packaged = {rid for _sel, rid, _ext in updater.PLATFORMS}
 
     index = updater.fetch_json(updater.INDEX_URL)
     raw = index.get("releases-index", [])
+    # Channel strings become shell arguments and branch names downstream, so
+    # drop anything that is not a plain dotted number rather than passing it on.
+    bad = [
+        e.get("channel-version")
+        for e in raw
+        if not updater.CHANNEL_RE.match(str(e.get("channel-version", "")))
+    ]
+    if bad:
+        print(f"warning: ignoring implausible channel ids {bad!r}", file=sys.stderr)
+    raw = [e for e in raw if updater.CHANNEL_RE.match(str(e.get("channel-version", "")))]
     channels = [
         {
             "channel": e.get("channel-version"),
@@ -532,11 +549,26 @@ def main(argv: list[str]) -> int:
 
     bumps, issues, lines, notices, transition = plan_lines(cfg, channels, repo)
 
+    # Which RIDs are packaged is a property of the recipe, not of this config, so
+    # read it from the newest tracked branch. Reading the recipe rather than a
+    # constant is what lets branches carry different shapes -- and the audit then
+    # reflects what the recipe actually does, which is the drift it exists to
+    # detect.
+    packaged: set[str] = set()
+    if lines:
+        newest_line = max(lines, key=lambda l: ckey(l["channel"]))
+        meta = git_show(repo, newest_line["branch"], "recipe/meta.yaml")
+        found = updater.discover_platforms(meta) if meta else None
+        packaged = {rid for _s, rid, _e in (found or updater.PLATFORMS)}
+    else:
+        packaged = {rid for _s, rid, _e in updater.PLATFORMS}
+
+
     # Architectures are audited once, against the newest tracked line: the RID
     # set is a property of .NET, not of a patch release.
     offered: list[str] = []
     if lines:
-        newest = max(lines, key=lambda l: ckey(l["channel"]))
+        newest = newest_line
         entry = next(
             (e for e in raw if e.get("channel-version") == newest["channel"]), None
         )

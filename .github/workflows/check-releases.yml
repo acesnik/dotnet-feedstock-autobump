@@ -30,6 +30,13 @@ on:
 permissions:
   contents: read
 
+# One run at a time. Without this, a scheduled run overlapping a manual one can
+# both pass the branch-existence check and race to create the same branch and PR.
+# Not cancel-in-progress: a run half way through pushing a branch should finish.
+concurrency:
+  group: check-dotnet-releases
+  cancel-in-progress: false
+
 env:
   FEEDSTOCK: acesnik/dotnet-feedstock
   UPSTREAM: conda-forge/dotnet-feedstock
@@ -148,24 +155,36 @@ jobs:
 
       - name: Base on upstream ${{ matrix.branch }}, not on a possibly-stale fork
         working-directory: feedstock
+        env:
+          # Via env, not ${{ }}: CHANNEL originates in Microsoft's JSON, and
+          # ${{ }} is textual substitution into the shell script, so a value
+          # containing shell metacharacters would execute. plan.py also validates
+          # the format, but defence in depth is free here.
+          CHANNEL: ${{ matrix.channel }}
+          BRANCH_IN: ${{ matrix.branch }}
         run: |
           # Each line is based on ITS OWN upstream branch. Basing everything on
           # main would rewrite an older line's recipe to the newest line's
           # version, which is the opposite of maintaining it.
           git remote add upstream "https://github.com/${{ env.UPSTREAM }}.git"
-          git fetch -q upstream "${{ matrix.branch }}"
-          git checkout -q -B "ci-base-${{ matrix.channel }}" \
-            "upstream/${{ matrix.branch }}"
-          echo "based on upstream/${{ matrix.branch }} $(git rev-parse --short HEAD)"
+          git fetch -q upstream "$BRANCH_IN"
+          git checkout -q -B "ci-base-$CHANNEL" "upstream/$BRANCH_IN"
+          echo "based on upstream/$BRANCH_IN $(git rev-parse --short HEAD)"
 
       - name: Rewrite meta.yaml
         id: write
         working-directory: feedstock
+        env:
+          CHANNEL: ${{ matrix.channel }}
         run: |
           # Only now do we pay for ~1 GB of downloads: the plan job already
           # confirmed via version comparison that there is something to hash.
+          #
+          # The updater discovers this branch's platform selectors from its own
+          # recipe, so an older shape (bare `# [win]`, no win-arm64) is written
+          # correctly rather than failing on a missing selector.
           python3 ../scripts/update-dotnet-version.py \
-            --channel "${{ matrix.channel }}" \
+            --channel "$CHANNEL" \
             --write --summary-json ../summary.json
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
@@ -176,16 +195,34 @@ jobs:
           print(f"branch=autobump/{d['sdk_version']}")
           PY
 
-      - name: Skip if that branch already exists
+      - name: Skip if this bump is already proposed
         id: exists
         working-directory: feedstock
+        env:
+          GH_TOKEN: ${{ secrets.FEEDSTOCK_TOKEN }}
+          BR: ${{ steps.write.outputs.branch }}
+          SDK: ${{ steps.write.outputs.sdk }}
+          BASE: ${{ matrix.branch }}
         run: |
-          # One branch per SDK version: re-runs are idempotent and a branch a
-          # human is working on is never force-pushed over.
-          if git ls-remote --exit-code --heads origin \
-               "${{ steps.write.outputs.branch }}" >/dev/null 2>&1; then
+          # Two independent checks, because branch-existence is NOT a sufficient
+          # proxy for "already proposed". A human's PR uses their own branch name
+          # (#116 proposes 10.0.302 against main from `v10update`), so checking
+          # only for `autobump/<sdk>` would open a duplicate.
+          if git ls-remote --exit-code --heads origin "$BR" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::${{ steps.write.outputs.branch }} exists already"
+            echo "::notice::$BR exists already"
+            exit 0
+          fi
+          # Any open PR against this base already carrying the target version?
+          # Logic lives in a script: embedding multi-line Python in a YAML block
+          # scalar dedents out of the block and breaks the workflow parse.
+          dupe=$(gh pr list --repo "${{ env.UPSTREAM }}" --base "$BASE" \
+                   --state open --limit 50 --json number,title,headRefName \
+                 | python3 ../scripts/find_duplicate_pr.py "$SDK" || true)
+          if [ -n "$dupe" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "::warning::$SDK is already proposed against $BASE by $dupe - skipping"
+            echo "\`$SDK\` already proposed against \`$BASE\` by $dupe" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
@@ -206,6 +243,7 @@ jobs:
           RUNTIME: ${{ steps.write.outputs.runtime }}
           SECURITY: ${{ steps.write.outputs.security }}
           BRANCH: ${{ steps.write.outputs.branch }}
+          BASE: ${{ matrix.branch }}
         run: |
           git config user.name  "dotnet-autobump"
           git config user.email "noreply@github.com"
@@ -221,7 +259,7 @@ jobs:
           # --base is the line's own branch, not main: a 8.0 bump belongs on v8.
           url=$(gh pr create --repo "${{ env.UPSTREAM }}" \
                   --head "${FEEDSTOCK%%/*}:$BRANCH" \
-                  --base "${{ matrix.branch }}" \
+                  --base "$BASE" \
                   --title "$title" --body-file ../body.md)
           echo "opened $url"
           echo "$url" >> "$GITHUB_STEP_SUMMARY"
@@ -318,12 +356,16 @@ jobs:
         id: cut
         env:
           GH_TOKEN: ${{ secrets.FEEDSTOCK_TOKEN }}
+          # Derived from an upstream channel id, so via env rather than ${{ }}.
+          CUT_IN: ${{ steps.tr.outputs.cut_branch }}
+          FROM_IN: ${{ steps.tr.outputs.from_branch }}
+          CUT_UPSTREAM: ${{ steps.tr.outputs.cut_upstream }}
         run: |
           set -euo pipefail
-          CUT='${{ steps.tr.outputs.cut_branch }}'
-          FROM='${{ steps.tr.outputs.from_branch }}'
+          CUT="$CUT_IN"
+          FROM="$FROM_IN"
           TARGET_REPO='${{ env.UPSTREAM }}'
-          [ '${{ steps.tr.outputs.cut_upstream }}' = 'true' ] || TARGET_REPO='${{ env.FEEDSTOCK }}'
+          [ "$CUT_UPSTREAM" = 'true' ] || TARGET_REPO='${{ env.FEEDSTOCK }}'
 
           if gh api "repos/$TARGET_REPO/git/ref/heads/$CUT" >/dev/null 2>&1; then
             echo "::warning::$CUT already exists on $TARGET_REPO - not touching it"

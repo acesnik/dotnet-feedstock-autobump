@@ -104,16 +104,34 @@ def test_rewrite_meta_reports_what_changed(updater, recipe):
         assert f"sha256 [{selector}]" in joined
 
 
-def test_rewrite_meta_refuses_a_recipe_missing_a_selector(updater, recipe):
-    # Drop the win-arm64 line: a recipe that has not been taught the platform
-    # must fail loudly, not silently skip it.
+def test_rewrite_meta_refuses_an_internally_inconsistent_recipe(updater, recipe):
+    """Declares a platform but has no sha256 line for it -> must fail loudly.
+
+    Note what is NOT an error any more: dropping *both* the platform and sha256
+    lines for an arch is simply an older recipe shape, which the tool now adapts
+    to. The error case is the recipe contradicting itself.
+    """
     text = "\n".join(
-        l for l in recipe.read_text().splitlines() if "# [win and arm64]" not in l
+        l for l in recipe.read_text().splitlines()
+        if not ("sha256" in l and l.rstrip().endswith("# [win and arm64]"))
     )
     recipe.write_text(text)
     with pytest.raises(SystemExit) as e:
         updater.rewrite_meta(recipe, "10.0.302", "10.0.10", HASHES, True)
     assert "win and arm64" in str(e.value)
+
+
+def test_dropping_a_platform_entirely_is_not_an_error(updater, recipe):
+    """Both lines gone = an older shape, which must just work."""
+    text = "\n".join(
+        l for l in recipe.read_text().splitlines() if "# [win and arm64]" not in l
+    )
+    recipe.write_text(text)
+    plats = updater.discover_platforms(recipe.read_text())
+    assert len(plats) == 5
+    hashes = {sel: f"{i + 1:064x}" for i, (sel, _r, _e) in enumerate(plats)}
+    updater.rewrite_meta(recipe, "10.0.302", "10.0.10", hashes, True)
+    assert 'set sdk_version = "10.0.302"' in recipe.read_text()
 
 
 def test_rewrite_meta_refuses_a_recipe_missing_a_version_var(updater, recipe):
@@ -129,7 +147,7 @@ def test_rewrite_meta_refuses_a_recipe_missing_a_version_var(updater, recipe):
 
 
 def test_render_block_covers_every_platform(updater):
-    block = updater.render_block("10.0.302", "10.0.10", HASHES)
+    block = updater.render_block("10.0.302", "10.0.10", HASHES, updater.PLATFORMS)
     assert 'set sdk_version = "10.0.302"' in block
     assert 'set runtime_version = "10.0.10"' in block
     for selector, digest in HASHES.items():
@@ -254,3 +272,78 @@ def _fake_urlopen(payload: bytes, declared_length: int | None = None):
             return False
 
     return lambda *a, **k: Resp()
+
+
+# --------------------------------------------------------------------------
+# shape adaptation
+#
+# The regression these guard against: PLATFORMS was a single global list matching
+# the newest recipe, so bumping a branch cut before win-arm64 failed outright
+# with "could not find the sha256 line for selector `# [win and x86_64]`". The
+# tool was 100% broken for v8 and v9 while every test passed.
+# --------------------------------------------------------------------------
+
+
+def test_discover_platforms_reads_the_new_shape(updater, recipe):
+    got = updater.discover_platforms(recipe.read_text())
+    assert [(s, r) for s, r, _e in got] == [
+        ("linux and aarch64", "linux-arm64"),
+        ("linux and x86_64", "linux-x64"),
+        ("osx and arm64", "osx-arm64"),
+        ("osx and x86_64", "osx-x64"),
+        ("win and x86_64", "win-x64"),
+        ("win and arm64", "win-arm64"),
+    ]
+
+
+def test_discover_platforms_reads_the_old_bare_win_shape(updater, recipe_old_shape):
+    got = updater.discover_platforms(recipe_old_shape.read_text())
+    assert len(got) == 5
+    assert ("win", "win-x64", ".zip") in got
+    assert not any(sel == "win and arm64" for sel, _r, _e in got)
+
+
+def test_extension_follows_the_rid(updater, recipe):
+    for sel, rid, ext in updater.discover_platforms(recipe.read_text()):
+        assert ext == (".zip" if rid.startswith("win") else ".tar.gz")
+
+
+def test_discover_platforms_returns_none_without_platform_lines(updater):
+    assert updater.discover_platforms("package:\n  name: x\n") is None
+
+
+def test_platforms_for_falls_back_when_the_recipe_is_absent(updater, tmp_path):
+    assert updater.platforms_for(tmp_path / "nope.yaml") == updater.PLATFORMS
+
+
+def test_old_shape_recipe_can_be_written(updater, recipe_old_shape):
+    """The exact case that was broken for v8 and v9."""
+    plats = updater.discover_platforms(recipe_old_shape.read_text())
+    hashes = {sel: f"{i + 1:064x}" for i, (sel, _r, _e) in enumerate(plats)}
+    changes = updater.rewrite_meta(recipe_old_shape, "8.0.423", "8.0.29", hashes, True)
+    text = recipe_old_shape.read_text()
+    assert 'set sdk_version = "8.0.423"' in text
+    # The bare selector must be preserved, not rewritten to the new form.
+    assert "# [win]" in text
+    assert "# [win and x86_64]" not in text
+    assert any("sha256 [win]" in c for c in changes)
+
+
+def test_old_shape_hash_lands_on_the_bare_win_selector(updater, recipe_old_shape):
+    plats = updater.discover_platforms(recipe_old_shape.read_text())
+    hashes = {sel: f"{i + 1:064x}" for i, (sel, _r, _e) in enumerate(plats)}
+    updater.rewrite_meta(recipe_old_shape, "8.0.423", "8.0.29", hashes, True)
+    line = next(
+        l for l in recipe_old_shape.read_text().splitlines()
+        if "sha256" in l and l.rstrip().endswith("# [win]")
+    )
+    assert hashes["win"] in line
+
+
+def test_render_block_follows_the_given_shape(updater, recipe_old_shape):
+    plats = updater.discover_platforms(recipe_old_shape.read_text())
+    hashes = {sel: f"{i + 1:064x}" for i, (sel, _r, _e) in enumerate(plats)}
+    block = updater.render_block("8.0.423", "8.0.29", hashes, plats)
+    assert "# [win]" in block
+    assert "# [win and arm64]" not in block
+    assert len(block.splitlines()) == 3 + 5

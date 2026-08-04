@@ -9,9 +9,10 @@ two structural reasons:
 1. It carries *two* independent versions. `sdk_version` and `runtime_version`
    are not the same number and drift apart within a release line (10.0.302 vs
    10.0.10, say). The bot has no concept of a second version.
-2. It carries *five* `sha256` values behind mutually-exclusive selectors. The
+2. It carries one `sha256` per platform behind mutually-exclusive selectors. The
    bot updates `sha256:` under `source:`; it has no path into
-   `{% set sha256 = "..." %}  # [linux and aarch64]`.
+   `{% set sha256 = "..." %}  # [linux and aarch64]`. How many there are, and
+   what the selectors look like, varies per branch -- see discover_platforms.
 
 Microsoft does publish everything needed as machine-readable JSON, including the
 sdk/runtime pairing that defeats the bot:
@@ -73,9 +74,13 @@ INDEX_URL = (
     "https://builds.dotnet.microsoft.com/dotnet/release-metadata/releases-index.json"
 )
 
-# (recipe selector, metadata rid, artifact extension) for each of the five
-# `sha256` lines in meta.yaml. Order matches the recipe so the emitted block
-# reads as a drop-in replacement.
+CHANNEL_RE = re.compile(r"^\d+\.\d+$")
+SDK_RE = re.compile(r"^[0-9A-Za-z.+]+$")
+
+# Fallback only. The real platform list is DISCOVERED from the target recipe by
+# discover_platforms() -- see the note there. This is used when no recipe is
+# available (e.g. --dry-run outside a feedstock) and describes the current shape
+# on main.
 PLATFORMS = [
     ("linux and aarch64", "linux-arm64", ".tar.gz"),
     ("linux and x86_64", "linux-x64", ".tar.gz"),
@@ -86,11 +91,58 @@ PLATFORMS = [
     ("win and x86_64", "win-x64", ".zip"),
     ("win and arm64", "win-arm64", ".zip"),
 ]
-# Deliberately absent: linux-arm (conda-forge's linux-armv7l). Microsoft ships
-# the RID, but conda-forge's linux-armv7l subdir has 3 packages in total -- no
-# icu, openssl or zlib for the runtime to depend on -- so a dotnet built there
-# would be unusable. linux-musl-* are likewise unmapped: conda-forge has no musl
-# subdir.
+# Deliberately absent from the default: linux-arm (conda-forge's linux-armv7l).
+# Microsoft ships the RID, but conda-forge's linux-armv7l subdir has 3 packages
+# in total -- no icu, openssl or zlib for the runtime to depend on -- so a dotnet
+# built there would be unusable. linux-musl-* are likewise unmapped: conda-forge
+# has no musl subdir.
+
+PLATFORM_LINE_RE = re.compile(
+    r'^\{%\s*set\s+platform\s*=\s*"([^"]+)"\s*%\}\s*#\s*\[([^\]]+)\]\s*$', re.M
+)
+
+
+def discover_platforms(text: str) -> list[tuple[str, str, str]] | None:
+    """Read the RID-to-selector mapping out of the recipe itself.
+
+    A hardcoded list cannot work here. This tool bumps several branches, and each
+    carries whatever recipe shape it was cut with: `main` has six platforms with
+    `# [win and x86_64]`, while a branch from before win-arm64 has five with a
+    bare `# [win]`. A single global list matches one of those and hard-fails on
+    the other -- which it did, on both v8 and v9.
+
+    The recipe already states the mapping unambiguously:
+
+        {% set platform = "linux-arm64" %}  # [linux and aarch64]
+        {% set platform = "win-x64" %}      # [win]
+
+    so read it from there and the tool adapts to whatever it is pointed at.
+
+    Extension is derived from the RID rather than parsed: the recipe's own `ext`
+    selectors say `zip` for win and `tar.gz` otherwise, and Microsoft publishes
+    exactly that.
+
+    Returns None when no platform lines are present, so callers can fall back.
+    """
+    found = [
+        (selector.strip(), rid, ".zip" if rid.startswith("win") else ".tar.gz")
+        for rid, selector in (
+            (m.group(1), m.group(2)) for m in PLATFORM_LINE_RE.finditer(text)
+        )
+    ]
+    return found or None
+
+
+def platforms_for(recipe: Path) -> list[tuple[str, str, str]]:
+    """Platforms for a specific recipe, falling back to PLATFORMS if unreadable."""
+    try:
+        found = discover_platforms(recipe.read_text())
+    except OSError:
+        found = None
+    if found is None:
+        log(f"  note: no platform lines in {recipe}; using built-in default shape")
+        return PLATFORMS
+    return found
 
 CHUNK = 1 << 20  # 1 MiB
 USER_AGENT = "dotnet-feedstock-version-updater (+https://github.com/conda-forge/dotnet-feedstock)"
@@ -220,14 +272,19 @@ def stream_hashes(url: str, expected_sha512: str | None) -> str:
     return sha256.hexdigest()
 
 
-def render_block(sdk_version: str, runtime_version: str, hashes: dict[str, str]) -> str:
+def render_block(
+    sdk_version: str,
+    runtime_version: str,
+    hashes: dict[str, str],
+    platforms: list[tuple[str, str, str]],
+) -> str:
     lines = [
         f'{{% set sdk_version = "{sdk_version}" %}}',
         f'{{% set runtime_version = "{runtime_version}" %}}',
         "{% set framework = '.'.join(sdk_version.split('.')[:2]) %}",
     ]
-    width = max(len(f'{{% set sha256 = "{hashes[s]}" %}}') for s, _, _ in PLATFORMS)
-    for selector, _rid, _ext in PLATFORMS:
+    width = max(len(f'{{% set sha256 = "{hashes[s]}" %}}') for s, _, _ in platforms)
+    for selector, _rid, _ext in platforms:
         stmt = f'{{% set sha256 = "{hashes[selector]}" %}}'
         lines.append(f"{stmt.ljust(width)}  # [{selector}]")
     return "\n".join(lines)
@@ -248,6 +305,9 @@ def rewrite_meta(
     text = path.read_text()
     original = text
     changes: list[str] = []
+    # Discover from the file being edited, not from a global: this is the whole
+    # point -- an older branch has a different set of selectors.
+    platforms = discover_platforms(text) or PLATFORMS
 
     def set_var(src: str, name: str, value: str) -> str:
         pattern = re.compile(
@@ -263,9 +323,9 @@ def rewrite_meta(
     text = set_var(text, "sdk_version", sdk_version)
     text = set_var(text, "runtime_version", runtime_version)
 
-    for selector, _rid, _ext in PLATFORMS:
+    for selector, _rid, _ext in platforms:
         # Anchor on the trailing selector comment -- that is the only thing
-        # distinguishing the five otherwise-identical sha256 lines.
+        # distinguishing the otherwise-identical sha256 lines.
         pattern = re.compile(
             r'(\{%\s*set\s+sha256\s*=\s*")([0-9a-fA-F]{64})("\s*%\}\s*#\s*\['
             + re.escape(selector)
@@ -390,6 +450,12 @@ def main(argv: list[str] | None = None) -> int:
     if channel is None:
         # "10.0.302" -> "10.0"
         channel = ".".join(args.sdk_version.split(".")[:2])
+    # Channel and version strings reach a shell in CI, and both originate in
+    # upstream JSON. Validate them here rather than trusting the caller.
+    if not CHANNEL_RE.match(channel):
+        sys.exit(f"error: refusing implausible channel {channel!r}")
+    if args.sdk_version and not SDK_RE.match(args.sdk_version):
+        sys.exit(f"error: refusing implausible sdk version {args.sdk_version!r}")
 
     log(f"fetching release index for channel {channel}...")
     index = fetch_json(INDEX_URL)
@@ -409,6 +475,12 @@ def main(argv: list[str] | None = None) -> int:
 
     sdk_version = sdk["version"]
     runtime_version = release["runtime"]["version"]
+    for label, value in (("sdk", sdk_version), ("runtime", runtime_version)):
+        if not SDK_RE.match(str(value)):
+            sys.exit(
+                f"error: upstream {label} version {value!r} contains unexpected "
+                "characters; refusing to use it"
+            )
     log(
         f"  release {release.get('release-version')} ({release.get('release-date')}): "
         f"sdk={sdk_version} runtime={runtime_version}"
@@ -490,30 +562,35 @@ def main(argv: list[str] | None = None) -> int:
         print(f"update-available {cur_sdk}->{sdk_version} {cur_rt}->{runtime_version}")
         return 10
 
+    platforms = platforms_for(args.recipe)
+    log(
+        "  recipe shape: "
+        + ", ".join(f"{rid}->[{sel}]" for sel, rid, _e in platforms)
+    )
     artifacts = {
-        sel: find_artifact(sdk, rid, ext) for sel, rid, ext in PLATFORMS
+        sel: find_artifact(sdk, rid, ext) for sel, rid, ext in platforms
     }
 
     if args.dry_run:
         log("\ndry run -- resolved artifacts, nothing downloaded:")
-        for sel, _rid, _ext in PLATFORMS:
+        for sel, _rid, _ext in platforms:
             a = artifacts[sel]
             print(f"# [{sel}]\n  {a['url']}\n  published sha512: {a.get('hash','<none>')[:24]}...")
         sys.stdout.flush()  # keep ordering sane when stderr and stdout share a tty
         log(
             "\nRun without --dry-run to download and hash "
-            f"{len(PLATFORMS)} artifacts (~1 GB of transfer)."
+            f"{len(platforms)} artifacts (~1 GB of transfer)."
         )
         return 0
 
     hashes: dict[str, str] = {}
-    for i, (sel, _rid, _ext) in enumerate(PLATFORMS, 1):
+    for i, (sel, _rid, _ext) in enumerate(platforms, 1):
         a = artifacts[sel]
-        log(f"[{i}/{len(PLATFORMS)}] {a['name']} ({sel})")
+        log(f"[{i}/{len(platforms)}] {a['name']} ({sel})")
         hashes[sel] = stream_hashes(a["url"], a.get("hash"))
         log(f"    sha256 {hashes[sel]}  (sha512 verified)")
 
-    block = render_block(sdk_version, runtime_version, hashes)
+    block = render_block(sdk_version, runtime_version, hashes, platforms)
 
     if args.check:
         text = args.recipe.read_text()
