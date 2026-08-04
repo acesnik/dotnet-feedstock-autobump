@@ -436,3 +436,49 @@ def test_a_consistent_recipe_is_not_flagged(updater, recipe_old_shape):
     hashes = {sel: f"{i + 1:064x}" for i, (sel, _r, _e) in enumerate(plats)}
     updater.rewrite_meta(recipe_old_shape, "8.0.423", "8.0.29", hashes, True)
     assert 'set sdk_version = "8.0.423"' in recipe_old_shape.read_text()
+
+
+# --------------------------------------------------------------------------
+# platforms_for: a missing recipe is fine, an unreadable one is not
+#
+# Falling back on an unreadable recipe would silently apply the newest shape's
+# selectors to a file we could not inspect, surfacing later as a wrong hash on
+# some platform rather than as a read error here.
+# --------------------------------------------------------------------------
+
+
+def test_missing_recipe_falls_back_to_the_default_shape(updater, tmp_path):
+    assert updater.platforms_for(tmp_path / "nope.yaml") == updater.PLATFORMS
+
+
+def test_undecodable_recipe_is_fatal_not_a_silent_fallback(updater, tmp_path):
+    """UnicodeDecodeError is a ValueError, so it was previously uncaught entirely."""
+    bad = tmp_path / "meta.yaml"
+    bad.write_bytes(b"\xff\xfe\x00binary garbage\x00\xff")
+    with pytest.raises(SystemExit) as e:
+        updater.platforms_for(bad)
+    msg = str(e.value)
+    assert "could not be read" in msg and "refusing to guess" in msg
+
+
+def test_unreadable_recipe_is_fatal(updater, tmp_path):
+    import os
+
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses permission bits")
+    p = tmp_path / "meta.yaml"
+    p.write_text("{% set platform = \"linux-x64\" %}  # [linux and x86_64]\n")
+    p.chmod(0o000)
+    try:
+        with pytest.raises(SystemExit) as e:
+            updater.platforms_for(p)
+        assert "could not be read" in str(e.value)
+    finally:
+        p.chmod(0o644)
+
+
+def test_a_recipe_with_no_platform_lines_falls_back(updater, tmp_path):
+    """Distinct from unreadable: readable but shapeless -> default is reasonable."""
+    p = tmp_path / "meta.yaml"
+    p.write_text("package:\n  name: x\n")
+    assert updater.platforms_for(p) == updater.PLATFORMS

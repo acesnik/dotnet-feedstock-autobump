@@ -21,22 +21,36 @@ way it can be tested.
 from __future__ import annotations
 
 import json
+import re
 import sys
 
 
-def find(prs: list[dict], sdk: str) -> str | None:
-    """First open PR whose title or head branch mentions this SDK version.
+def mentions(text: str, sdk: str) -> bool:
+    """Does `text` mention this exact version, on a token boundary?
 
-    Deliberately a substring test on the version rather than anything cleverer.
-    A version like `10.0.302` is specific enough that a mention in either place
-    means someone is already proposing it, and the cost of a false positive
-    (skipping a run, logging why) is far lower than opening a duplicate PR
-    against a shared feedstock.
+    A plain substring test was wrong: searching for `8.0.42` matched a PR titled
+    `8.0.423`, which would skip a legitimate bump. .NET patch numbers happen to
+    be three digits today so it could not bite yet, but the failure mode is
+    silent, so bound the match instead of relying on that.
+
+    The boundary excludes word characters and dots on both sides, so `8.0.423`
+    matches in `autobump/8.0.423` and in `8.0.423 / runtime 8.0.29`, but `8.0.42`
+    matches neither.
+    """
+    return re.search(rf"(?<![\w.]){re.escape(sdk)}(?![\w.])", text) is not None
+
+
+def find(prs: list[dict], sdk: str) -> str | None:
+    """First open PR whose title or head branch proposes this SDK version.
+
+    A mention in either place means someone is already proposing it. The cost of
+    a false positive (skipping a run, and logging why) is far lower than opening a
+    duplicate PR against a shared feedstock, so this errs toward skipping.
     """
     for pr in prs:
         title = str(pr.get("title", ""))
         head = str(pr.get("headRefName", ""))
-        if sdk in title or sdk in head:
+        if mentions(title, sdk) or mentions(head, sdk):
             return f"#{pr.get('number')} ({head})"
     return None
 

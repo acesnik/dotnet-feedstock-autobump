@@ -174,11 +174,29 @@ def discover_platforms(text: str) -> list[tuple[str, str, str]] | None:
 
 
 def platforms_for(recipe: Path) -> list[tuple[str, str, str]]:
-    """Platforms for a specific recipe, falling back to PLATFORMS if unreadable."""
+    """Platforms for a specific recipe.
+
+    A MISSING recipe falls back to the built-in shape -- that is the legitimate
+    case, e.g. `--dry-run` run outside a feedstock checkout.
+
+    A recipe that exists but cannot be read is fatal instead. Falling back there
+    would silently apply the newest shape's selectors to a recipe we could not
+    actually inspect, and the failure would surface as a wrong hash on some
+    platform rather than as a read error. Note UnicodeDecodeError is a ValueError,
+    not an OSError, so it was previously not caught at all and would crash with a
+    traceback instead of a message.
+    """
     try:
-        found = discover_platforms(recipe.read_text())
-    except OSError:
-        found = None
+        text = recipe.read_text()
+    except FileNotFoundError:
+        log(f"  note: {recipe} not found; using built-in default shape")
+        return PLATFORMS
+    except (OSError, UnicodeDecodeError) as exc:
+        sys.exit(
+            f"error: {recipe} exists but could not be read "
+            f"({type(exc).__name__}: {exc}); refusing to guess its platform shape"
+        )
+    found = discover_platforms(text)
     if found is None:
         log(f"  note: no platform lines in {recipe}; using built-in default shape")
         return PLATFORMS

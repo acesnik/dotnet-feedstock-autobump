@@ -463,6 +463,14 @@ per-commit, since a failure there is upstream's change, not yours.
   ref first, which let a stale *local* branch shadow the remote one and silently
   report upstream `v8` as `8.0.407` when it was at `8.0.408` — wrong data, no
   error, in a tool whose whole job is reading other people's branches.
+- **Duplicate detection matches a version on token boundaries**, not as a plain
+  substring — `8.0.42` used to match a PR titled `8.0.423` and would have skipped
+  a legitimate bump. It still errs toward skipping, since a false positive costs a
+  logged run while a false negative costs a duplicate PR on a shared feedstock.
+- **An unreadable recipe is fatal, a missing one is not.** Missing falls back to
+  the built-in shape (the `--dry-run`-outside-a-feedstock case); existing but
+  unreadable exits, because falling back there would apply the newest shape's
+  selectors to a file that was never inspected and surface later as a wrong hash.
 - **A new RID needs recipe surgery, not just a hash.** The escalation issue spells
   this out, but the trap is real: adding an arch usually requires *narrowing* an
   existing broader selector, and forgetting to means silently shipping the wrong
