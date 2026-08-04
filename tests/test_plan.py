@@ -428,3 +428,68 @@ def test_issue_keys_are_unique_and_stable(plan, real_config, feedstock):
     keys = r["issue_keys"]
     assert len(keys) == len(set(keys)), "duplicate keys would defeat dedup"
     assert all(k == k.strip() and " " not in k for k in keys)
+
+
+# --------------------------------------------------------------------------
+# per-line architecture audit
+#
+# Auditing only the newest line and applying the verdict everywhere was the
+# original review's finding #6. Each line has its own recipe AND its own set of
+# published RIDs, so a conclusion drawn from 10.0 can be false for 8.0.
+# --------------------------------------------------------------------------
+
+LINES = [
+    {"channel": "10.0", "branch": "main"},
+    {"channel": "9.0", "branch": "v9"},
+    {"channel": "8.0", "branch": "v8"},
+]
+NEWEST = LINES[0]
+
+
+def test_rid_dropped_from_an_older_line_only(plan):
+    """8.0 stops publishing win-arm64 while 10.0 still does -> flag 8.0 only."""
+    offered = lambda ch: (
+        ["linux-x64", "win-x64"] if ch == "8.0" else ["linux-x64", "win-x64", "win-arm64"]
+    )
+    packaged = lambda br: {"linux-x64", "win-x64", "win-arm64"}
+    issues = plan.per_line_rid_issues(LINES, NEWEST, offered, packaged)
+    assert [i["key"] for i in issues] == ["rid-dropped-8.0-win-arm64"]
+    assert "specific to this line" in issues[0]["body"]
+
+
+def test_newest_line_is_left_to_the_main_audit(plan):
+    """No duplicate finding for the newest line, which plan_rids already covers."""
+    offered = lambda ch: ["linux-x64"]
+    packaged = lambda br: {"linux-x64", "win-x64"}
+    issues = plan.per_line_rid_issues(LINES, NEWEST, offered, packaged)
+    assert all("10.0" not in i["key"] for i in issues)
+
+
+def test_all_lines_consistent_is_silent(plan):
+    offered = lambda ch: ["linux-x64", "win-x64"]
+    packaged = lambda br: {"linux-x64", "win-x64"}
+    assert plan.per_line_rid_issues(LINES, NEWEST, offered, packaged) == []
+
+
+def test_an_older_line_packaging_less_is_not_a_problem(plan):
+    """A line predating win-arm64 packages fewer RIDs -- that is normal."""
+    offered = lambda ch: ["linux-x64", "win-x64", "win-arm64"]
+    packaged = lambda br: {"linux-x64"} if br == "v8" else {"linux-x64", "win-arm64"}
+    assert plan.per_line_rid_issues(LINES, NEWEST, offered, packaged) == []
+
+
+def test_unreachable_metadata_is_not_treated_as_a_drop(plan):
+    """An empty offered list means 'could not tell', not 'nothing published'."""
+    offered = lambda ch: []
+    packaged = lambda br: {"linux-x64", "win-x64"}
+    assert plan.per_line_rid_issues(LINES, NEWEST, offered, packaged) == []
+
+
+def test_dropped_keys_are_namespaced_per_line(plan):
+    """Two lines dropping the same RID must not collide in issue dedup."""
+    offered = lambda ch: ["linux-x64"]
+    packaged = lambda br: {"linux-x64", "win-x64"}
+    issues = plan.per_line_rid_issues(LINES, NEWEST, offered, packaged)
+    keys = [i["key"] for i in issues]
+    assert sorted(keys) == ["rid-dropped-8.0-win-x64", "rid-dropped-9.0-win-x64"]
+    assert len(keys) == len(set(keys))

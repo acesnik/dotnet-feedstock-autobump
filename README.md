@@ -31,6 +31,11 @@ deciding:
 | A preview line exists, or a line is skipped by policy | **notice** in the run summary |
 | Nothing changed | a table in the run summary |
 
+A channel id that fails the format check is dropped rather than passed to a
+shell — and that drop is surfaced as a notice, because it is the one event that
+makes the bot go blind to a whole release line. An earlier version logged it to
+stderr only.
+
 Notices are the third category, and they exist because silence was this
 workflow's original sin. A hardcoded channel list would have let .NET 11 and 12
 ship unremarked. A notice opens nothing and costs one line, but it makes
@@ -407,6 +412,10 @@ per-commit, since a failure there is upstream's change, not yours.
 - **`active_subdirs` is a manual list.** Nothing detects conda-forge adding or
   retiring a subdir, so a genuinely new platform stays invisible until someone
   updates it. The `win-32` case above is why it can't be inferred cheaply.
+- **The architecture audit runs per line.** Each line has its own recipe *and*
+  its own set of published RIDs, so a "dropped RID" verdict drawn from 10.0 can be
+  false for 8.0. Breakage is therefore checked per line, and an older line simply
+  packaging fewer RIDs is not flagged — that is normal, not a drop.
 - **`git_show` searches remotes before the bare ref.** It used to try the bare
   ref first, which let a stale *local* branch shadow the remote one and silently
   report upstream `v8` as `8.0.407` when it was at `8.0.408` — wrong data, no

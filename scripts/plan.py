@@ -431,6 +431,48 @@ def plan_lines(cfg, channels, repo: Path, updater=None):
     return bumps, issues, lines, notices, transition
 
 
+def per_line_rid_issues(lines, newest_line, offered_fn, packaged_fn):
+    """Per-line breakage check: does each line still publish what it packages?
+
+    Auditing only the newest line and applying that verdict everywhere was wrong.
+    Each line has its own recipe *and* its own set of published RIDs, so a
+    "dropped RID" conclusion drawn from 10.0 can be false for 8.0 -- and the
+    question that actually matters is per line, since a bump fails on the line
+    whose artifact is missing.
+
+    Callables are injected so this is testable without network or git.
+    """
+    issues = []
+    for line in lines:
+        if line is newest_line:
+            continue  # the newest line is covered by the main audit
+        line_offered = offered_fn(line["channel"])
+        if not line_offered:
+            continue  # nothing published (or unreachable) -- not evidence of a drop
+        missing = packaged_fn(line["branch"]) - set(line_offered)
+        for rid in sorted(missing):
+            issues.append(
+                {
+                    "key": f"rid-dropped-{line['channel']}-{rid}",
+                    "title": (
+                        f"{line['channel']} packages {rid} but Microsoft no longer "
+                        f"publishes it for that line"
+                    ),
+                    "body": (
+                        f"`{line['branch']}` packages **{rid}**, but it is not among "
+                        f"the SDK artifacts Microsoft publishes for "
+                        f"{line['channel']}.\n\n"
+                        f"The next {line['channel']} bump will fail outright when "
+                        "that artifact cannot be found. Note this is specific to "
+                        "this line: a RID can be dropped from an older line while "
+                        "still shipping on the newest, which is why the audit runs "
+                        "per line rather than once."
+                    ),
+                }
+            )
+    return issues
+
+
 def plan_rids(cfg, offered, packaged):
     """Audit the architectures Microsoft offers against the ones we package."""
     rid_map = cfg.get("rid_map", {})
@@ -522,8 +564,6 @@ def main(argv: list[str]) -> int:
         for e in raw
         if not updater.CHANNEL_RE.match(str(e.get("channel-version", "")))
     ]
-    if bad:
-        print(f"warning: ignoring implausible channel ids {bad!r}", file=sys.stderr)
     raw = [e for e in raw if updater.CHANNEL_RE.match(str(e.get("channel-version", "")))]
     channels = [
         {
@@ -538,39 +578,61 @@ def main(argv: list[str]) -> int:
 
     bumps, issues, lines, notices, transition = plan_lines(cfg, channels, repo, updater)
 
-    # Which RIDs are packaged is a property of the recipe, not of this config, so
-    # read it from the newest tracked branch. Reading the recipe rather than a
-    # constant is what lets branches carry different shapes -- and the audit then
-    # reflects what the recipe actually does, which is the drift it exists to
-    # detect.
+    # A channel id that fails the format check is DROPPED above, which means the
+    # bot silently stops tracking it. Surfacing that is the whole point of
+    # notices: an earlier version logged it to stderr only, so the one event that
+    # makes the bot go blind was the one event absent from the run summary.
+    for ch_id in bad:
+        notices.append(
+            f"ignored channel id {ch_id!r} — not a plain dotted number, so it is "
+            "not tracked. If Microsoft has changed their channel id format, "
+            "CHANNEL_RE needs updating or this line will stay invisible."
+        )
+
+    def offered_rids(channel: str) -> list[str]:
+        """Archive RIDs the given channel's newest release publishes."""
+        entry = next((e for e in raw if e.get("channel-version") == channel), None)
+        if not entry:
+            return []
+        releases = updater.fetch_json(entry["releases.json"]).get("releases", [])
+        if not releases:
+            return []
+        return sorted(
+            {
+                f["rid"]
+                for f in releases[0]["sdk"].get("files", [])
+                if str(f.get("name", "")).endswith((".tar.gz", ".zip"))
+            }
+        )
+
+    def packaged_rids(branch: str) -> set[str]:
+        """RIDs a branch's own recipe packages.
+
+        Read from the recipe rather than a constant, because branches carry
+        different shapes -- and because drift between config and recipe is
+        precisely what this audit exists to detect.
+        """
+        meta = git_show(repo, branch, "recipe/meta.yaml")
+        found = updater.discover_platforms(meta) if meta else None
+        return {rid for _s, rid, _e in (found or updater.PLATFORMS)}
+
+    # Auditing only the newest line and applying the verdict to all of them was
+    # wrong: each line has its own recipe AND its own set of published RIDs, so a
+    # "dropped RID" conclusion drawn from 10.0 could be false for 8.0. The
+    # breakage check is therefore per line -- that is the question that matters,
+    # since a bump fails on the line whose artifact is missing.
+    offered: list[str] = []
     packaged: set[str] = set()
     if lines:
         newest_line = max(lines, key=lambda l: ckey(l["channel"]))
-        meta = git_show(repo, newest_line["branch"], "recipe/meta.yaml")
-        found = updater.discover_platforms(meta) if meta else None
-        packaged = {rid for _s, rid, _e in (found or updater.PLATFORMS)}
+        offered = offered_rids(newest_line["channel"])
+        packaged = packaged_rids(newest_line["branch"])
+
+        issues.extend(
+            per_line_rid_issues(lines, newest_line, offered_rids, packaged_rids)
+        )
     else:
         packaged = {rid for _s, rid, _e in updater.PLATFORMS}
-
-
-    # Architectures are audited once, against the newest tracked line: the RID
-    # set is a property of .NET, not of a patch release.
-    offered: list[str] = []
-    if lines:
-        newest = newest_line
-        entry = next(
-            (e for e in raw if e.get("channel-version") == newest["channel"]), None
-        )
-        if entry:
-            releases = updater.fetch_json(entry["releases.json"]).get("releases", [])
-            if releases:
-                offered = sorted(
-                    {
-                        f["rid"]
-                        for f in releases[0]["sdk"].get("files", [])
-                        if str(f.get("name", "")).endswith((".tar.gz", ".zip"))
-                    }
-                )
 
     rid_issues, rid_skipped = plan_rids(cfg, offered, packaged) if offered else ([], [])
     issues.extend(rid_issues)
