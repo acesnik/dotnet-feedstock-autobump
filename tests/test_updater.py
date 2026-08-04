@@ -33,8 +33,8 @@ import pytest
         ("1.0.0!", False),
     ],
 )
-def test_conda_version_problem(plan, version, ok):
-    assert (plan.conda_version_problem(version) is None) is ok
+def test_conda_version_problem(updater, version, ok):
+    assert (updater.conda_version_problem(version) is None) is ok
 
 
 # --------------------------------------------------------------------------
@@ -347,3 +347,92 @@ def test_render_block_follows_the_given_shape(updater, recipe_old_shape):
     assert "# [win]" in block
     assert "# [win and arm64]" not in block
     assert len(block.splitlines()) == 3 + 5
+
+
+# --------------------------------------------------------------------------
+# validation: shell-safety and packageability are DIFFERENT questions
+#
+# Conflating them broke `--dry-run --channel 11.0` outright: a preview version's
+# hyphen is unpackageable but perfectly safe to inspect, and rejecting it at
+# resolve time destroyed the ability to look at a preview at all.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "11.0.100-preview.6.26359.118",  # hyphen: unpackageable, but SAFE to read
+        "10.0.302",
+        "8.0.423",
+    ],
+)
+def test_shell_safe_accepts_plausible_versions_including_previews(updater, value):
+    updater.assert_shell_safe("sdk version", value)  # must not raise
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "10.0.3; rm -rf /",
+        "10.0.3$(whoami)",
+        "10.0.3`id`",
+        "10.0.3 && curl evil",
+        "10.0.3|tee",
+        "10.0.3\nnewline",
+        "10.0.3'quote",
+    ],
+)
+def test_shell_safe_rejects_dangerous_versions(updater, value):
+    with pytest.raises(SystemExit) as e:
+        updater.assert_shell_safe("sdk version", value)
+    assert "refusing" in str(e.value)
+
+
+def test_conda_version_problem_has_exactly_one_definition(updater, plan):
+    """plan.py used to carry its own copy; two copies drift."""
+    assert not hasattr(plan, "conda_version_problem"), (
+        "plan.py should use updater.conda_version_problem, not redefine it"
+    )
+    assert updater.conda_version_problem("11.0.100-preview.6") is not None
+    assert updater.conda_version_problem("10.0.302") is None
+
+
+def test_channel_pattern(updater):
+    for good in ("10.0", "3.1", "8.0"):
+        assert updater.CHANNEL_RE.match(good)
+    for bad in ("10", "10.0.302", "10.0-preview", "; rm -rf /", ""):
+        assert not updater.CHANNEL_RE.match(bad)
+
+
+# --------------------------------------------------------------------------
+# recipe self-consistency
+# --------------------------------------------------------------------------
+
+
+def test_orphan_sha256_is_rejected(updater, recipe):
+    """A sha256 line with no matching platform line must not be silently skipped.
+
+    discover_platforms trusts the `platform` lines, so an orphan hash would be
+    left STALE -- the recipe would then pair one platform's URL with another
+    platform's hash and fail at download with a confusing mismatch, far from the
+    cause.
+    """
+    text = "\n".join(
+        l for l in recipe.read_text().splitlines()
+        if not (l.startswith('{% set platform = "win-arm64"'))
+    )
+    recipe.write_text(text)
+    plats = updater.discover_platforms(recipe.read_text())
+    hashes = {sel: f"{i + 1:064x}" for i, (sel, _r, _e) in enumerate(plats)}
+    with pytest.raises(SystemExit) as e:
+        updater.rewrite_meta(recipe, "10.0.302", "10.0.10", hashes, True)
+    msg = str(e.value)
+    assert "win and arm64" in msg and "contradicts itself" in msg
+
+
+def test_a_consistent_recipe_is_not_flagged(updater, recipe_old_shape):
+    """The old five-platform shape is symmetric and must pass cleanly."""
+    plats = updater.discover_platforms(recipe_old_shape.read_text())
+    hashes = {sel: f"{i + 1:064x}" for i, (sel, _r, _e) in enumerate(plats)}
+    updater.rewrite_meta(recipe_old_shape, "8.0.423", "8.0.29", hashes, True)
+    assert 'set sdk_version = "8.0.423"' in recipe_old_shape.read_text()

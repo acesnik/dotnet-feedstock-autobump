@@ -145,23 +145,12 @@ def ckey(ch: str):
     return [int(x) if x.isdigit() else 0 for x in ch.split(".")]
 
 
-def conda_version_problem(v: str) -> str | None:
-    """Why conda-build would reject this as a package version, if it would.
-
-    Microsoft's preview SDKs are named like `11.0.100-preview.6.26359.118`, and
-    conda-build rejects that outright: `Bad character(s) (-) in package/version`.
-    Package filenames are `name-version-build`, so a hyphen in the version is
-    structurally ambiguous. Guarding here means a preview line added to `tracked`
-    escalates with an explanation instead of opening a PR that cannot build.
-    """
-    bad = [c for c in "-!/ " if c in v]
-    if bad:
-        return f"conda-build rejects {''.join(sorted(set(bad)))!r} in a package version"
-    return None
-
-
-def plan_lines(cfg, channels, repo: Path):
+def plan_lines(cfg, channels, repo: Path, updater=None):
     """Per-line bumps, plus escalations about which lines exist at all."""
+    # Loaded lazily so callers (and tests) can pass three arguments; the version
+    # rules live in the updater so there is one definition, not two.
+    if updater is None:
+        updater = load_updater()
     tracked: dict[str, str] = cfg.get("tracked", {})
     policy = cfg.get("policy", "manual")
     by_ch = {c["channel"]: c for c in channels}
@@ -285,7 +274,7 @@ def plan_lines(cfg, channels, repo: Path):
             )
             continue
 
-        problem = conda_version_problem(info["latest_sdk"])
+        problem = updater.conda_version_problem(info["latest_sdk"])
         if problem:
             issues.append(
                 {
@@ -375,7 +364,7 @@ def plan_lines(cfg, channels, repo: Path):
             out_ch = newest_tracked
             out_branch = tracked[out_ch]
             cut = "v" + out_ch.split(".")[0]
-            problem = conda_version_problem(info["latest_sdk"])
+            problem = updater.conda_version_problem(info["latest_sdk"])
             if transition_cfg.get("enabled") and out_branch == "main" and not problem:
                 if git_show(repo, cut, "recipe/meta.yaml") is not None:
                     notices.append(
@@ -547,7 +536,7 @@ def main(argv: list[str]) -> int:
         for e in raw
     ]
 
-    bumps, issues, lines, notices, transition = plan_lines(cfg, channels, repo)
+    bumps, issues, lines, notices, transition = plan_lines(cfg, channels, repo, updater)
 
     # Which RIDs are packaged is a property of the recipe, not of this config, so
     # read it from the newest tracked branch. Reading the recipe rather than a

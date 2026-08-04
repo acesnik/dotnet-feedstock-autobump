@@ -216,9 +216,23 @@ jobs:
           # Any open PR against this base already carrying the target version?
           # Logic lives in a script: embedding multi-line Python in a YAML block
           # scalar dedents out of the block and breaks the workflow parse.
-          dupe=$(gh pr list --repo "${{ env.UPSTREAM }}" --base "$BASE" \
-                   --state open --limit 50 --json number,title,headRefName \
-                 | python3 ../scripts/find_duplicate_pr.py "$SDK" || true)
+          #
+          # gh runs SEPARATELY from the filter and its failure is fatal. Piping
+          # the two with `|| true` made this fail OPEN: a gh error (auth, rate
+          # limit, network) was indistinguishable from "no duplicate found", so
+          # the bot would sail past a safety check and open a competing PR. If we
+          # cannot determine whether a duplicate exists, we must not push.
+          if ! gh pr list --repo "${{ env.UPSTREAM }}" --base "$BASE" \
+                 --state open --limit 50 --json number,title,headRefName \
+                 > /tmp/open-prs.json; then
+            echo "::error::could not list open PRs on $BASE; refusing to push blind"
+            exit 1
+          fi
+          dupe=""
+          if python3 ../scripts/find_duplicate_pr.py "$SDK" < /tmp/open-prs.json \
+               > /tmp/dupe.txt; then
+            dupe=$(cat /tmp/dupe.txt)
+          fi
           if [ -n "$dupe" ]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "::warning::$SDK is already proposed against $BASE by $dupe - skipping"

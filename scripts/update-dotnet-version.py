@@ -75,7 +75,44 @@ INDEX_URL = (
 )
 
 CHANNEL_RE = re.compile(r"^\d+\.\d+$")
-SDK_RE = re.compile(r"^[0-9A-Za-z.+]+$")
+# Shell-dangerous characters only. This is NOT the same question as "can conda
+# package this": preview versions contain hyphens, which conda-build rejects but
+# which are perfectly safe to *inspect*. An earlier version conflated the two and
+# made `--dry-run --channel 11.0` a hard error, destroying the ability to look at
+# a preview at all. Packageability is conda_version_problem's job, checked only
+# when writing.
+UNSAFE_RE = re.compile(r"""[\s;&|<>()$`'"\\!*?\[\]{}~]""")
+
+
+def assert_shell_safe(label: str, value: str) -> None:
+    """Refuse values that could break out of a shell argument.
+
+    These strings become shell arguments and branch names in CI, and they
+    originate in upstream JSON, so they are validated here rather than trusted.
+    """
+    bad = UNSAFE_RE.search(str(value))
+    if bad:
+        sys.exit(
+            f"error: upstream {label} {value!r} contains {bad.group(0)!r}; "
+            "refusing to use it"
+        )
+
+
+def conda_version_problem(v: str) -> str | None:
+    """Why conda-build would reject this as a package version, if it would.
+
+    Microsoft's preview SDKs are named like `11.0.100-preview.6.26359.118`, and
+    conda-build rejects that outright: `Bad character(s) (-) in package/version`.
+    Package filenames are `name-version-build`, so a hyphen in the version is
+    structurally ambiguous.
+
+    Lives here rather than in plan.py so there is one definition shared by the
+    planner (which escalates) and the writer (which refuses).
+    """
+    bad = [c for c in "-!/ " if c in v]
+    if bad:
+        return f"conda-build rejects {''.join(sorted(set(bad)))!r} in a package version"
+    return None
 
 # Fallback only. The real platform list is DISCOVERED from the target recipe by
 # discover_platforms() -- see the note there. This is used when no recipe is
@@ -99,6 +136,9 @@ PLATFORMS = [
 
 PLATFORM_LINE_RE = re.compile(
     r'^\{%\s*set\s+platform\s*=\s*"([^"]+)"\s*%\}\s*#\s*\[([^\]]+)\]\s*$', re.M
+)
+SHA256_SELECTOR_RE = re.compile(
+    r'^\{%\s*set\s+sha256\s*=\s*"[0-9a-fA-F]{64}"\s*%\}\s*#\s*\[([^\]]+)\]\s*$', re.M
 )
 
 
@@ -309,6 +349,20 @@ def rewrite_meta(
     # point -- an older branch has a different set of selectors.
     platforms = discover_platforms(text) or PLATFORMS
 
+    # Symmetry check. discover_platforms trusts the `platform` lines, so a sha256
+    # line with no matching platform line would be silently skipped and left
+    # STALE -- the recipe would then pair one platform's URL with another's hash
+    # and fail at download with a confusing mismatch. Catch it here instead.
+    declared = {sel for sel, _r, _e in platforms}
+    hashed = set(SHA256_SELECTOR_RE.findall(text))
+    orphans = hashed - declared
+    if orphans:
+        sys.exit(
+            f"error: {path} has sha256 line(s) for selector(s) "
+            f"{sorted(orphans)} with no matching `set platform` line. The recipe "
+            "contradicts itself; fix it rather than letting a stale hash survive."
+        )
+
     def set_var(src: str, name: str, value: str) -> str:
         pattern = re.compile(
             r'(\{%\s*set\s+' + re.escape(name) + r'\s*=\s*")([^"]*)("\s*%\})'
@@ -454,8 +508,8 @@ def main(argv: list[str] | None = None) -> int:
     # upstream JSON. Validate them here rather than trusting the caller.
     if not CHANNEL_RE.match(channel):
         sys.exit(f"error: refusing implausible channel {channel!r}")
-    if args.sdk_version and not SDK_RE.match(args.sdk_version):
-        sys.exit(f"error: refusing implausible sdk version {args.sdk_version!r}")
+    if args.sdk_version:
+        assert_shell_safe("sdk version", args.sdk_version)
 
     log(f"fetching release index for channel {channel}...")
     index = fetch_json(INDEX_URL)
@@ -475,11 +529,19 @@ def main(argv: list[str] | None = None) -> int:
 
     sdk_version = sdk["version"]
     runtime_version = release["runtime"]["version"]
-    for label, value in (("sdk", sdk_version), ("runtime", runtime_version)):
-        if not SDK_RE.match(str(value)):
+    for label, value in (("sdk version", sdk_version), ("runtime version", runtime_version)):
+        assert_shell_safe(label, value)
+
+    # Refuse an unpackageable version BEFORE hashing. Checked only for modes that
+    # would produce a recipe change, so --dry-run and --probe can still inspect a
+    # preview channel; and checked here rather than after the loop so we do not
+    # burn ~1 GB of downloads only to reject the result.
+    if args.write or args.check:
+        problem = conda_version_problem(sdk_version)
+        if problem:
             sys.exit(
-                f"error: upstream {label} version {value!r} contains unexpected "
-                "characters; refusing to use it"
+                f"error: refusing {sdk_version!r}: {problem}. Preview versions "
+                "are not packageable; the plan escalates them as an issue."
             )
     log(
         f"  release {release.get('release-version')} ({release.get('release-date')}): "

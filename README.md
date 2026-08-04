@@ -210,9 +210,30 @@ newest shape. There is now an old-shape fixture.
 
 `PLATFORMS` survives only as a fallback for when no recipe is available.
 
-A recipe that *declares* a platform but has no `sha256` line for it still fails
-loudly — that is the recipe contradicting itself, as opposed to simply being an
-older shape.
+Self-consistency is checked **both ways**, because discovery trusts the `platform`
+lines. A platform with no `sha256` line fails loudly; so does a `sha256` line with
+no `platform` line — that orphan would otherwise be silently left **stale**, and
+the recipe would pair one platform's URL with another's hash and fail at download,
+far from the cause. Dropping *both* lines for an arch is not an error: that is
+simply an older shape.
+
+### Shell-safety and packageability are separate checks
+
+Two different questions, and conflating them broke `--dry-run --channel 11.0`
+entirely:
+
+- **Shell-safe?** Enforced always, on every upstream-derived value, because these
+  become shell arguments and branch names in CI. Rejects `;`, `$`, backticks,
+  quotes, whitespace and friends.
+- **Packageable by conda?** Enforced only for `--write` / `--check`, and *before*
+  any downloading. A preview's hyphen makes it unpackageable but perfectly safe to
+  *inspect*, so rejecting it at resolve time destroyed the ability to look at a
+  preview at all — and an earlier placement burned ~1 GB of downloads before
+  rejecting the result.
+
+`conda_version_problem` has exactly one definition, in the updater, used by both
+the planner (which escalates) and the writer (which refuses). A test asserts
+`plan.py` has not grown a second copy.
 
 ### Two gates on architecture viability, and why both are needed
 
