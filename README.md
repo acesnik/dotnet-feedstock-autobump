@@ -277,6 +277,12 @@ The **bump** job runs only when the plan found a version change, and that gate i
 the point — computing a SHA-256 requires the bytes, so an unconditional check
 would download ~1 GB every single run to discover nothing had changed.
 
+The duplicate check is ordered **before** the rewrite for the same reason. It
+originally ran after, which meant a run where every line was already proposed
+still downloaded ~1 GB per line before discovering there was nothing to do — three
+lines, ~3 GB, to do nothing. It uses the target version from the plan rather than
+from the rewrite step, which is what makes the earlier ordering possible.
+
 The **notify** job files issues, deduplicating on a hidden `<!-- autobump-key:
 … -->` marker rather than the title, so retitling an issue by hand doesn't cause a
 duplicate next week.

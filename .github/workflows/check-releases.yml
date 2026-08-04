@@ -171,43 +171,25 @@ jobs:
           git checkout -q -B "ci-base-$CHANNEL" "upstream/$BRANCH_IN"
           echo "based on upstream/$BRANCH_IN $(git rev-parse --short HEAD)"
 
-      - name: Rewrite meta.yaml
-        id: write
-        working-directory: feedstock
-        env:
-          CHANNEL: ${{ matrix.channel }}
-        run: |
-          # Only now do we pay for ~1 GB of downloads: the plan job already
-          # confirmed via version comparison that there is something to hash.
-          #
-          # The updater discovers this branch's platform selectors from its own
-          # recipe, so an older shape (bare `# [win]`, no win-arm64) is written
-          # correctly rather than failing on a missing selector.
-          python3 ../scripts/update-dotnet-version.py \
-            --channel "$CHANNEL" \
-            --write --summary-json ../summary.json
-          python3 - <<'PY' >> "$GITHUB_OUTPUT"
-          import json
-          d = json.load(open("../summary.json"))
-          print(f"sdk={d['sdk_version']}")
-          print(f"runtime={d['runtime_version']}")
-          print(f"security={str(d['security']).lower()}")
-          print(f"branch=autobump/{d['sdk_version']}")
-          PY
-
+      # Ordered BEFORE the rewrite on purpose. It used to run after, so a run
+      # where every line was already proposed still downloaded ~1 GB per line
+      # before discovering there was nothing to do.
       - name: Skip if this bump is already proposed
         id: exists
         working-directory: feedstock
         env:
           GH_TOKEN: ${{ secrets.FEEDSTOCK_TOKEN }}
-          BR: ${{ steps.write.outputs.branch }}
-          SDK: ${{ steps.write.outputs.sdk }}
+          # From the PLAN, not from the write step -- that is what lets this run
+          # BEFORE ~1 GB of downloading instead of after it.
+          SDK: ${{ matrix.latest_sdk }}
           BASE: ${{ matrix.branch }}
         run: |
           # Two independent checks, because branch-existence is NOT a sufficient
           # proxy for "already proposed". A human's PR uses their own branch name
           # (#116 proposes 10.0.302 against main from `v10update`), so checking
           # only for `autobump/<sdk>` would open a duplicate.
+          BR="autobump/$SDK"
+          echo "branch=$BR" >> "$GITHUB_OUTPUT"
           if git ls-remote --exit-code --heads origin "$BR" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "::notice::$BR exists already"
@@ -241,7 +223,33 @@ jobs:
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Rewrite meta.yaml
+        id: write
+        if: steps.exists.outputs.exists == 'false'
+        working-directory: feedstock
+        env:
+          CHANNEL: ${{ matrix.channel }}
+        run: |
+          # Only now do we pay for ~1 GB of downloads: the plan job already
+          # confirmed via version comparison that there is something to hash.
+          #
+          # The updater discovers this branch's platform selectors from its own
+          # recipe, so an older shape (bare `# [win]`, no win-arm64) is written
+          # correctly rather than failing on a missing selector.
+          python3 ../scripts/update-dotnet-version.py \
+            --channel "$CHANNEL" \
+            --write --summary-json ../summary.json
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          d = json.load(open("../summary.json"))
+          print(f"sdk={d['sdk_version']}")
+          print(f"runtime={d['runtime_version']}")
+          print(f"security={str(d['security']).lower()}")
+          print(f"branch=autobump/{d['sdk_version']}")
+          PY
+
       - name: Show the diff
+        if: steps.exists.outputs.exists == 'false'
         working-directory: feedstock
         run: |
           git --no-pager diff
@@ -256,7 +264,7 @@ jobs:
           SDK: ${{ steps.write.outputs.sdk }}
           RUNTIME: ${{ steps.write.outputs.runtime }}
           SECURITY: ${{ steps.write.outputs.security }}
-          BRANCH: ${{ steps.write.outputs.branch }}
+          BRANCH: ${{ steps.exists.outputs.branch }}
           BASE: ${{ matrix.branch }}
         run: |
           git config user.name  "dotnet-autobump"
