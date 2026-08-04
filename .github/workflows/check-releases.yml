@@ -299,7 +299,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131  # v7.0.0, matching upload-artifact v7
         with:
           name: plan
 
@@ -471,7 +471,10 @@ jobs:
                   --body-file ../body.md)
           echo "opened $url"
           echo "$url" >> "$GITHUB_STEP_SUMMARY"
-          gh pr comment "$url" --body "@conda-forge-admin, please rerender"
+          # No rerender comment here. The `rerender` job requests them one at a
+          # time after this job, because two rerenders of the same feedstock at
+          # once collide (see that job). Commenting here would re-create exactly
+          # the race that job exists to avoid.
 
       # Step 3 of 3: keep the declared policy honest. channels.json is
       # human-owned, so this is a PR against this repo rather than a direct edit.
@@ -541,8 +544,15 @@ jobs:
     # commit yet, rather than being told which ones this run opened. That makes it
     # idempotent and self-healing -- a PR whose rerender failed in an earlier run
     # gets picked up by the next one.
-    needs: [plan, bump]
-    if: always() && needs.bump.result == 'success' && inputs.dry_run != true
+    # Gated on PLAN, not on bump. Gating on bump meant that when nothing was
+    # stale the bump job was skipped, so this job never ran -- which silently
+    # defeated the whole point: an autobump PR whose rerender failed in an
+    # earlier run would never be retried.
+    #
+    # Waits for `transition` as well, because that job also opens autobump/ PRs
+    # and they need rerendering too.
+    needs: [plan, bump, transition]
+    if: always() && needs.plan.result == 'success' && inputs.dry_run != true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

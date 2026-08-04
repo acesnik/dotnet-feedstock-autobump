@@ -41,22 +41,6 @@ def already_rerendered(pr: dict) -> bool:
     return False
 
 
-def select(prs: list[dict], prefix: str = "autobump/") -> list[int]:
-    """Open PRs from our own branches that carry no rerender commit.
-
-    Restricted to our branch prefix so a human's in-progress PR is never poked
-    with an automated rerender request they did not ask for.
-    """
-    out = []
-    for pr in prs:
-        if not str(pr.get("headRefName", "")).startswith(prefix):
-            continue
-        if already_rerendered(pr):
-            continue
-        out.append(int(pr["number"]))
-    return sorted(out)
-
-
 def candidates(prs: list[dict], prefix: str = "autobump/") -> list[int]:
     """Stage one: our own open PRs, by branch prefix. No commit data needed.
 

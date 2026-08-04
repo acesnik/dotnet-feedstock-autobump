@@ -317,8 +317,11 @@ what was *not* the cause — the delay after PR creation was near-identical (19s
 17s), so waiting longer after opening the PR would not have helped. Concurrency
 was the variable.
 
-So a separate `rerender` job runs after the whole matrix and requests them
-sequentially with a gap. Since a rerender takes minutes, that reduces overlap
+So a separate `rerender` job runs after the whole matrix — and after the
+`transition` job, which also opens `autobump/` PRs — and requests them
+sequentially with a gap. It is gated on the **plan** succeeding, not on the bump
+job: gating on bump meant that when nothing was stale the bump job was skipped and
+this job never ran, silently defeating the self-healing behaviour below. Since a rerender takes minutes, that reduces overlap
 rather than eliminating it — which is why the job is **stateless**: it finds open
 `autobump/` PRs carrying no `MNT: Re-rendered` commit, rather than being told what
 this run opened. Any PR whose rerender failed earlier gets picked up next run,
