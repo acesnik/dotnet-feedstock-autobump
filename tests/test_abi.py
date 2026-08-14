@@ -370,7 +370,7 @@ def test_glibc_shortfall_becomes_an_issue(abi_check, abi_probe):
         abi_probe.OPENSSL_SONAMES, abi_probe.vkey,
     )
     assert len(issues) == 1
-    assert issues[0]["key"] == "glibc-floor-10.0-10.0.10"
+    assert issues[0]["key"] == "glibc-floor-10.0-needs2.27-declared2.17"
     assert "2.27" in issues[0]["body"] and "2.17" in issues[0]["body"]
 
 
@@ -420,23 +420,50 @@ def test_openssl_exposure_becomes_an_issue(abi_check, abi_probe):
         abi_probe.OPENSSL_SONAMES, abi_probe.vkey,
     )
     assert len(issues) == 1
-    assert issues[0]["key"] == "openssl-soname-10.0-10.0.10"
+    assert issues[0]["key"] == "openssl-soname-10.0-unloadable-4"
     assert "undeclared" in issues[0]["body"]
 
 
 def test_issue_keys_are_stable_for_dedup(abi_check, abi_probe):
-    """The notify job dedups on `key`, so the same finding must key identically.
-
-    An unstable key re-files the same issue every Monday.
-    """
+    """The notify job dedups on `key`, so the same finding must key identically."""
     a, _ = abi_check.findings(_result(), abi_probe.OPENSSL_SONAMES, abi_probe.vkey)
     b, _ = abi_check.findings(_result(), abi_probe.OPENSSL_SONAMES, abi_probe.vkey)
     assert [i["key"] for i in a] == [i["key"] for i in b]
-    # ...and must change when the runtime does, so a new release is re-reported.
-    c, _ = abi_check.findings(
+
+
+def test_keys_do_not_change_with_the_runtime_version(abi_check, abi_probe):
+    """A patch bump that changes nothing about the finding must not re-file it.
+
+    The keys used to embed the runtime version, on the reasoning that a new
+    release deserves a fresh report. That is wrong for a standing condition:
+    "openssl is undeclared on linux-x64" is true of every release, so it would
+    have opened three new issues every .NET patch cycle, forever. The key must
+    describe the finding, not when it was noticed.
+    """
+    a, _ = abi_check.findings(
+        _result(runtime="10.0.10"), abi_probe.OPENSSL_SONAMES, abi_probe.vkey
+    )
+    b, _ = abi_check.findings(
         _result(runtime="10.0.11"), abi_probe.OPENSSL_SONAMES, abi_probe.vkey
     )
-    assert [i["key"] for i in c] != [i["key"] for i in a]
+    assert [i["key"] for i in a] == [i["key"] for i in b], "re-files on every patch"
+
+
+def test_keys_do_change_when_the_finding_changes(abi_check, abi_probe):
+    """A floor that moves, or a declaration that changes, IS news."""
+    base, _ = abi_check.findings(
+        _result(floor="2.27", declared="2.17"), abi_probe.OPENSSL_SONAMES, abi_probe.vkey
+    )
+    moved, _ = abi_check.findings(
+        _result(floor="2.34", declared="2.17"), abi_probe.OPENSSL_SONAMES, abi_probe.vkey
+    )
+    redeclared, _ = abi_check.findings(
+        _result(floor="2.27", declared="2.28"), abi_probe.OPENSSL_SONAMES, abi_probe.vkey
+    )
+    gkey = lambda rs: [i["key"] for i in rs if i["key"].startswith("glibc-")]
+    assert gkey(base) and gkey(moved) and gkey(base) != gkey(moved)
+    # 2.28 satisfies a 2.27 floor, so the glibc finding disappears entirely.
+    assert gkey(redeclared) == []
 
 
 def test_no_glibc_data_is_reported_as_suspect(abi_check, abi_probe):

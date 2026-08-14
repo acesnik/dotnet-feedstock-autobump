@@ -358,9 +358,15 @@ def findings(result: dict, known: dict, vkey) -> tuple[list, list]:
             f"| `{rid}` | **{floor}** | {eff} | {', '.join((drv or [])[:2]) or '—'} |"
             for rid, floor, eff, drv in glibc_bad
         )
+        # Keyed on the FINDING, not on the release we happened to notice it in.
+        # Keying on the runtime version looked right -- a new release should be
+        # re-reported -- but it makes the bot re-file an unchanged, already-known
+        # condition every patch cycle. What is newsworthy is the floor moving or
+        # the declaration changing, so the key carries those and nothing else.
+        worst = max(glibc_bad, key=lambda t: vkey(t[1]))
         issues.append(
             {
-                "key": f"glibc-floor-{ch}-{runtime}",
+                "key": f"glibc-floor-{ch}-needs{worst[1]}-declared{worst[2]}",
                 "title": (
                     f".NET {ch} requires a newer glibc than the recipe declares "
                     f"(runtime {runtime})"
@@ -404,9 +410,15 @@ def findings(result: dict, known: dict, vkey) -> tuple[list, list]:
             f"**{', '.join(v['admitted_unsupported'])}** |"
             for rid, v in ssl_bad
         )
+        # As above: the unloadable majors ARE the finding. "openssl is undeclared
+        # on linux-x64" is a standing condition, so keying it per runtime version
+        # would open three fresh issues every .NET patch cycle, indefinitely.
+        unloadable = sorted(
+            {m for _rid, v in ssl_bad for m in v["admitted_unsupported"]}, key=vkey
+        )
         issues.append(
             {
-                "key": f"openssl-soname-{ch}-{runtime}",
+                "key": f"openssl-soname-{ch}-unloadable-{'-'.join(unloadable)}",
                 "title": (
                     f".NET {ch} can be resolved against an openssl it cannot load "
                     f"(runtime {runtime})"
