@@ -493,3 +493,79 @@ def test_dropped_keys_are_namespaced_per_line(plan):
     keys = [i["key"] for i in issues]
     assert sorted(keys) == ["rid-dropped-8.0-win-x64", "rid-dropped-9.0-win-x64"]
     assert len(keys) == len(set(keys))
+
+
+# --------------------------------------------------------------------------
+# Ambiguous refs: a fork remote shadowing upstream
+# --------------------------------------------------------------------------
+def _repo_with_remote_refs(tmp_path, remotes: dict[str, str]):
+    """A repo with two commits, and refs/remotes/<name>/main pointing at each.
+
+    Built with `update-ref` rather than real remotes: the failure being tested is
+    purely about which ref name wins, and real clones would make the fixture slow
+    for no extra coverage.
+    """
+    import subprocess
+
+    repo = tmp_path / "amb"
+    (repo / "recipe").mkdir(parents=True)
+
+    def run(*args):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+    subprocess.run(["git", "init", "-q", str(repo)], check=True, capture_output=True)
+    run("symbolic-ref", "HEAD", "refs/heads/main")
+    run("config", "user.email", "t@t")
+    run("config", "user.name", "t")
+
+    shas = {}
+    for label in ("old", "new"):
+        (repo / "recipe" / "meta.yaml").write_text(f"# {label}\n")
+        run("add", "recipe/meta.yaml")
+        run("commit", "-q", "-m", label)
+        shas[label] = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    for remote, label in remotes.items():
+        run("update-ref", f"refs/remotes/{remote}/main", shas[label])
+    return repo, shas
+
+
+def test_ambiguous_ref_detects_a_fork_shadowing_upstream(plan, tmp_path):
+    """The real failure: `acesnik/main` was read instead of upstream's main.
+
+    Remote ordering is alphabetical, so the fork won, and the tool reported the
+    fork's stale recipe (10.0.100) as upstream's (10.0.302) -- which also made an
+    already-packaged architecture look missing. Silent, and in the one place the
+    tool is supposed to be authoritative.
+    """
+    repo, shas = _repo_with_remote_refs(
+        tmp_path, {"acesnik": "old", "originDoNotPushHere": "new"}
+    )
+    amb = plan.ambiguous_ref(repo, "main")
+    assert amb is not None
+    chosen, resolved = amb
+    assert chosen == "acesnik/main", "alphabetical order should still pick the fork"
+    assert resolved["acesnik/main"] == shas["old"][:12]
+    assert resolved["originDoNotPushHere/main"] == shas["new"][:12]
+
+
+def test_agreeing_remotes_are_not_flagged(plan, tmp_path):
+    """No false positive when every remote is at the same commit."""
+    repo, _shas = _repo_with_remote_refs(tmp_path, {"a": "new", "b": "new"})
+    assert plan.ambiguous_ref(repo, "main") is None
+
+
+def test_single_remote_is_never_ambiguous(plan, feedstock):
+    """CI checks out one repository, so this must stay quiet there."""
+    assert plan.ambiguous_ref(feedstock, "main") is None
+
+
+def test_bare_ref_is_tried_last(plan, feedstock):
+    """A stale LOCAL branch must not shadow a remote one -- the original bug."""
+    candidates = plan.git_candidates(feedstock, "v8")
+    assert candidates[-1] == "v8"
+    assert candidates[0] == "origin/v8"
+    assert len(candidates) == len(set(candidates)), "candidates must be deduped"

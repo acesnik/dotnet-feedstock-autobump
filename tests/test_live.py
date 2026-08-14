@@ -31,6 +31,9 @@ def test_release_index_has_the_fields_we_read(updater):
             "support-phase",
             "release-type",
             "latest-sdk",
+            # plan.py carries this through so abi_check.py can build a runtime
+            # tarball URL. Without it no ABI probe happens at all.
+            "latest-runtime",
             "releases.json",
         ):
             assert key in e, f"{key} missing from a channel entry"
@@ -99,6 +102,52 @@ def test_the_declared_active_subdirs_all_exist(plan, real_config):
     """Catches a typo in channels.json, and a subdir conda-forge retires."""
     for subdir in real_config["active_subdirs"]:
         assert plan.repodata_size(subdir) is not None, f"{subdir} has no repodata"
+
+
+def test_runtime_tarball_url_pattern_still_resolves(abi_probe, updater):
+    """abi_probe builds this URL by hand, so a renamed path breaks it silently.
+
+    Nothing else in the repo fetches the *runtime* archive -- the updater hashes
+    the SDK -- so if Microsoft moves this path, the ABI check degrades to a
+    "could not probe" notice every week and nothing else complains.
+    """
+    import urllib.request
+
+    index = updater.fetch_json(updater.INDEX_URL)
+    active = next(e for e in index["releases-index"] if e["support-phase"] == "active")
+    runtime = active["latest-runtime"]
+    for rid in ("linux-x64", "linux-arm64"):
+        url = abi_probe.RUNTIME_URL.format(runtime=runtime, rid=rid)
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            assert resp.status == 200, url
+            assert int(resp.headers["Content-Length"]) > 0
+
+
+def test_probing_a_real_runtime_yields_plausible_abi_facts(abi_probe, updater):
+    """End-to-end against a real ~30 MB artifact.
+
+    Asserts shape and plausibility, not specific numbers: the floor moving is a
+    real event the bot files an issue about, so pinning `2.27` here would turn a
+    correctly-detected upstream change into a red test suite. What must not
+    happen is the parser silently returning nothing -- that would make every
+    future drift invisible, which is the failure this check exists to prevent.
+    """
+    import re
+
+    index = updater.fetch_json(updater.INDEX_URL)
+    active = next(e for e in index["releases-index"] if e["support-phase"] == "active")
+    out = abi_probe.probe("linux-x64", active["latest-runtime"])
+
+    assert out["glibc_inspected"] > 5, "almost no native objects found in the tarball"
+    assert out["glibc_floor"] is not None, "no GLIBC_ requirements parsed at all"
+    assert re.fullmatch(r"2\.\d+(\.\d+)?", out["glibc_floor"]), out["glibc_floor"]
+
+    assert out["openssl_shim_found"], "crypto shim missing or renamed"
+    assert out["openssl_majors"], "no recognised openssl soname in the shim"
+    # Every shipped .NET has named libssl.so.3 since 6.0; losing it would mean
+    # the soname list was restructured and OPENSSL_SONAMES needs revisiting.
+    assert "3" in out["openssl_majors"], out["openssl_sonames"]
 
 
 def test_the_recipe_url_host_still_serves_the_artifacts(updater):

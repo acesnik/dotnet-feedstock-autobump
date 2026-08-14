@@ -38,6 +38,16 @@ def plan():
 
 
 @pytest.fixture(scope="session")
+def abi_probe():
+    return _load("abi_probe", SCRIPTS / "abi_probe.py")
+
+
+@pytest.fixture(scope="session")
+def abi_check():
+    return _load("abi_check", SCRIPTS / "abi_check.py")
+
+
+@pytest.fixture(scope="session")
 def real_config():
     """The repo's actual channels.json, comments stripped.
 

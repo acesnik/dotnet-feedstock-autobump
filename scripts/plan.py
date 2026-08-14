@@ -69,19 +69,8 @@ def strip_comments(obj):
     return obj
 
 
-def git_show(repo: Path, ref: str, path: str) -> str | None:
-    """Read a file at a ref without checking it out. None if the ref is absent.
-
-    Remote-tracking refs are tried FIRST and the bare ref last. That ordering is
-    deliberate: trying the bare ref first let a stale *local* branch shadow the
-    remote one, which silently reported upstream v8 as 8.0.407 when it was
-    actually at 8.0.408 -- wrong data, no error, in a tool whose entire job is
-    reading other people's branches.
-
-    A CI checkout names the remote `origin`, but a developer's clone may not
-    (this feedstock's upstream is called `originDoNotPushHere`), so all remotes
-    are searched before falling back.
-    """
+def git_candidates(repo: Path, ref: str) -> list[str]:
+    """Refs to try for `ref`, in preference order. See git_show for the ordering."""
     candidates = [f"origin/{ref}", f"upstream/{ref}"]
     remotes = subprocess.run(
         ["git", "-C", str(repo), "remote"], capture_output=True, text=True
@@ -96,14 +85,60 @@ def git_show(repo: Path, ref: str, path: str) -> str | None:
     )
     if allrefs.returncode == 0:
         candidates += [r for r in allrefs.stdout.split() if r.endswith(f"/{ref}")]
-    # Bare ref last -- see the note above.
+    # Bare ref last -- see the note in git_show.
     candidates.append(ref)
 
-    seen = set()
-    for candidate in candidates:
-        if candidate in seen:
-            continue
-        seen.add(candidate)
+    seen, ordered = set(), []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            ordered.append(c)
+    return ordered
+
+
+def ambiguous_ref(repo: Path, ref: str) -> tuple[str, dict[str, str]] | None:
+    """Detect a ref that several remotes provide at DIFFERENT commits.
+
+    Ordering among remotes is alphabetical, so a fork remote can shadow upstream
+    and the tool then reports the fork's recipe as though it were upstream's --
+    silently, and in a tool whose whole job is reading other people's branches.
+    Observed for real: a local clone with `acesnik` and `originDoNotPushHere`
+    remotes read the fork's stale `main` (10.0.100) instead of upstream's
+    (10.0.302), which also made an already-packaged architecture look missing.
+
+    CI is unaffected: it checks out one repository, so the only remote is
+    `origin`. This exists for the local dry run -- the case where a maintainer is
+    most likely to trust the output and least likely to check.
+
+    Returns (chosen_ref, {ref: sha}) when the commits disagree, else None.
+    """
+    resolved: dict[str, str] = {}
+    for candidate in git_candidates(repo, ref):
+        r = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "-q", f"{candidate}^{{commit}}"],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            resolved[candidate] = r.stdout.strip()[:12]
+    if len(set(resolved.values())) <= 1:
+        return None
+    return next(iter(resolved)), resolved
+
+
+def git_show(repo: Path, ref: str, path: str) -> str | None:
+    """Read a file at a ref without checking it out. None if the ref is absent.
+
+    Remote-tracking refs are tried FIRST and the bare ref last. That ordering is
+    deliberate: trying the bare ref first let a stale *local* branch shadow the
+    remote one, which silently reported upstream v8 as 8.0.407 when it was
+    actually at 8.0.408 -- wrong data, no error, in a tool whose entire job is
+    reading other people's branches.
+
+    A CI checkout names the remote `origin`, but a developer's clone may not
+    (this feedstock's upstream is called `originDoNotPushHere`), so all remotes
+    are searched before falling back.
+    """
+    for candidate in git_candidates(repo, ref):
         r = subprocess.run(
             ["git", "-C", str(repo), "show", f"{candidate}:{path}"],
             capture_output=True,
@@ -213,6 +248,10 @@ def plan_lines(cfg, channels, repo: Path, updater=None):
             "current_sdk": cur_sdk,
             "current_runtime": cur_rt,
             "latest_sdk": info["latest_sdk"],
+            # Carried so abi_check.py can build a runtime-tarball URL without
+            # re-fetching the index. It is the runtime that ships the native
+            # code, and the SDK version does not name it.
+            "latest_runtime": info.get("latest_runtime"),
             "support_phase": phase,
             "stale": info["latest_sdk"] != cur_sdk,
         }
@@ -377,6 +416,10 @@ def plan_lines(cfg, channels, repo: Path, updater=None):
                 transition = {
                     "to_channel": ch,
                     "to_sdk": info["latest_sdk"],
+                    # So the ABI check can inspect the incoming line before its
+                    # PR is opened -- a major boundary is where both observed
+                    # ABI drifts happened.
+                    "to_runtime": info.get("latest_runtime"),
                     "to_release_type": rtype,
                     "from_channel": out_ch,
                     "from_branch": out_branch,
@@ -571,12 +614,34 @@ def main(argv: list[str]) -> int:
             "support_phase": e.get("support-phase"),
             "release_type": e.get("release-type"),
             "latest_sdk": e.get("latest-sdk"),
+            "latest_runtime": e.get("latest-runtime"),
             "eol_date": e.get("eol-date"),
         }
         for e in raw
     ]
 
     bumps, issues, lines, notices, transition = plan_lines(cfg, channels, repo, updater)
+
+    # Every version, hash and ABI verdict below was read from one ref per line. If
+    # several remotes offer that ref at different commits the choice is
+    # alphabetical, so say which one won rather than reporting a fork's recipe as
+    # upstream's. A notice, not an issue: in CI there is only ever one remote, so
+    # this fires exactly when a human is running it locally.
+    for ch_id, branch in sorted(cfg.get("tracked", {}).items(), key=lambda kv: ckey(kv[0])):
+        amb = ambiguous_ref(repo, branch)
+        if not amb:
+            continue
+        chosen, resolved = amb
+        others = ", ".join(
+            f"`{r}` {sha}" for r, sha in resolved.items() if r != chosen
+        )
+        notices.append(
+            f"ref `{branch}` ({ch_id}) is ambiguous: read from `{chosen}` "
+            f"{resolved[chosen]}, but also present as {others}. Everything "
+            f"reported for {ch_id} comes from `{chosen}` — if that is a fork "
+            "rather than upstream, the versions and ABI findings are for the "
+            "wrong tree."
+        )
 
     # A channel id that fails the format check is DROPPED above, which means the
     # bot silently stops tracking it. Surfacing that is the whole point of

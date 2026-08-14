@@ -71,6 +71,37 @@ jobs:
         id: plan
         run: |
           python3 scripts/plan.py channels.json feedstock > plan.json
+
+          # The ABI check merges its findings back into plan.json, so the outputs
+          # and summary below -- and the notify job's dedup-by-key -- pick them up
+          # with no second mechanism to keep in step.
+          #
+          # A failure here must NOT fail the job. Bumping is the primary function
+          # and the plan job gates every other job, so an ABI bug taking the whole
+          # bot down would be a worse outcome than a missed check. But it must not
+          # be silent either: the original plan is kept and a notice is injected,
+          # so the run summary says the check did not run instead of looking clean.
+          if python3 scripts/abi_check.py channels.json feedstock plan.json \
+               > plan.abi.json 2> abi.err; then
+            mv plan.abi.json plan.json
+          else
+            echo "::warning::ABI check failed; plan reported without it"
+            cat abi.err
+            python3 - <<'PY'
+          import json
+          from pathlib import Path
+          p = Path("plan.json")
+          d = json.loads(p.read_text())
+          d.setdefault("notices", []).append(
+              "the ABI check (glibc floor, openssl sonames) FAILED to run this "
+              "week -- see the plan step log. Treat the absence of ABI findings "
+              "below as unknown, not as clean."
+          )
+          d["abi"] = {"enabled": True, "failed": True}
+          p.write_text(json.dumps(d, indent=2))
+          PY
+          fi
+
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           p = json.load(open("plan.json"))
@@ -99,6 +130,33 @@ jobs:
               mark = "**STALE**" if l["stale"] else "current"
               print(f"| {l['channel']} | `{l['branch']}` | `{l['current_sdk']}` "
                     f"| `{l['latest_sdk']}` | {l['support_phase']} | {mark} |")
+          abi = p.get("abi") or {}
+          if abi.get("failed"):
+              print("\n### ABI: check FAILED to run — findings unknown, not clean\n")
+          elif abi.get("results"):
+              # Printed every run, pass or fail. A check that only speaks up when
+              # it finds something is indistinguishable from one that stopped
+              # running, which is the failure this whole file is written against.
+              print(f"\n### ABI (declared vs required)\n")
+              print("| line | platform | glibc needs | glibc declared | openssl admits | runtime loads | |")
+              print("|---|---|---|---|---|---|---|")
+              for r in abi["results"]:
+                  for rid, e in sorted(r["rids"].items()):
+                      pr = e.get("probe") or {}
+                      v = e.get("openssl_verdict") or {}
+                      if not pr:
+                          print(f"| {r['channel']} | `{rid}` | — | — | — | — | probe failed |")
+                          continue
+                      decl = e.get("glibc_declared") or e.get("glibc_rendered") or "?"
+                      bad = (v.get("admitted_unsupported") or []) or (
+                          pr.get("glibc_floor") and decl != "?"
+                          and tuple(int(x) if x.isdigit() else 0 for x in pr["glibc_floor"].split("."))
+                              > tuple(int(x) if x.isdigit() else 0 for x in decl.split("."))
+                      )
+                      print(f"| {r['channel']} | `{rid}` | {pr.get('glibc_floor')} | {decl} "
+                            f"| {', '.join(v.get('admitted') or []) or '—'} "
+                            f"| {', '.join(v.get('supported') or []) or '—'} "
+                            f"| {'**MISMATCH**' if bad else 'ok'} |")
           print(f"\n### Architectures\n")
           print(f"- packaged: `{'`, `'.join(p['rids']['packaged'])}`")
           print(f"- offered but not packaged:\n")
