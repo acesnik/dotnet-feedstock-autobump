@@ -342,7 +342,24 @@ def findings(result: dict, known: dict, vkey) -> tuple[list, list]:
                 + ", ".join(f"`{c}`" for c in v["unparseable"])
                 + " — check by hand"
             )
-        if v["admitted_unsupported"]:
+        if v["undeclared"]:
+            # NOT an issue, deliberately. An absent dependency is the opposite of
+            # an unconstrained one: nothing is declared, so nothing is installed,
+            # and nothing pulls openssl 4 either (conda-forge pins openssl to
+            # 3.x). Treating "absent" as "admits everything" reported a risk that
+            # runs the wrong way round, every week, on a state no bump changed.
+            #
+            # There IS a real gap here, but it is a different one and it belongs
+            # to a human once, not to a weekly bot: a bare `conda install dotnet`
+            # has no libssl at all, so crypto has nothing to dlopen.
+            notices.append(
+                f"{ch} `{rid}`: no openssl dependency applies, so none is "
+                "installed — a minimal environment has no libssl for .NET to "
+                "dlopen, the same way it dlopens `icu` (which this recipe does "
+                "declare). Standing recipe question, not version drift: no bump "
+                "changes it, and nothing pulls openssl 4 either."
+            )
+        elif v["admitted_unsupported"]:
             ssl_bad.append((rid, v))
         elif v["supported_excluded"]:
             notices.append(
