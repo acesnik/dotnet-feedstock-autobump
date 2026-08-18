@@ -414,14 +414,50 @@ def test_probe_failure_is_never_silent(abi_check, abi_probe):
     assert any("could not probe" in n and "incomplete" in n for n in notices)
 
 
-def test_openssl_exposure_becomes_an_issue(abi_check, abi_probe):
-    issues, _ = abi_check.findings(
+def test_undeclared_openssl_is_a_notice_not_an_issue(abi_check, abi_probe):
+    """An absent dependency is the OPPOSITE of an unconstrained one.
+
+    This used to open an issue, reasoning that no pin "admits" openssl 4. But
+    nothing is declared, so nothing is installed, and conda-forge pins openssl to
+    3.x so nothing else pulls 4 either -- the reported risk ran the wrong way
+    round. Worse, it is a standing property of the recipe that no version bump
+    changes, so it re-filed on every run for a state nobody had altered.
+
+    There is a real gap (a bare env has no libssl for .NET to dlopen), but it is a
+    one-off recipe question for a human, not a weekly bot finding.
+    """
+    issues, notices = abi_check.findings(
         _result(floor="2.17", declared="2.17", openssl=(), rid="linux-x64"),
+        abi_probe.OPENSSL_SONAMES, abi_probe.vkey,
+    )
+    assert issues == []
+    assert any("no openssl dependency applies" in n for n in notices)
+    assert any("dlopen" in n for n in notices)
+
+
+def test_a_declared_pin_admitting_an_unloadable_major_still_escalates(abi_check, abi_probe):
+    """The case that actually broke aarch64: a bare `openssl` run dep.
+
+    Declared but unpinned, so the solver took the newest (4.0.1), which ships only
+    libssl.so.4. That IS a real defect and must stay an issue -- demoting the
+    undeclared case must not demote this one with it.
+    """
+    issues, _ = abi_check.findings(
+        _result(floor="2.17", declared="2.17",
+                openssl=(("", "linux", True),), rid="linux-x64"),
         abi_probe.OPENSSL_SONAMES, abi_probe.vkey,
     )
     assert len(issues) == 1
     assert issues[0]["key"] == "openssl-soname-10.0-unloadable-4"
-    assert "undeclared" in issues[0]["body"]
+
+
+def test_a_correct_pin_is_silent(abi_check, abi_probe):
+    issues, notices = abi_check.findings(
+        _result(floor="2.17", declared="2.17",
+                openssl=(("<4", "linux", True),), rid="linux-x64"),
+        abi_probe.OPENSSL_SONAMES, abi_probe.vkey,
+    )
+    assert issues == [] and notices == []
 
 
 def test_issue_keys_are_stable_for_dedup(abi_check, abi_probe):
