@@ -30,7 +30,8 @@
     "nothing to detect and watching them would only add noise."
   ],
   "tracked": {
-    "10.0": "main",
+    "11.0": "main",
+    "10.0": "v10",
     "9.0": "v9",
     "8.0": "v8"
   },
