@@ -191,6 +191,10 @@ def plan_lines(cfg, channels, repo: Path, updater=None):
     by_ch = {c["channel"]: c for c in channels}
     bumps, issues, lines, notices = [], [], [], []
     transition = None
+    # A transition already half-applied: the vN branch exists but `tracked`
+    # still points the outgoing line at `main`. Not a transition to propose --
+    # only the knowledge that one is in flight, which the bump deferral needs.
+    half_applied = None
     transition_cfg = cfg.get("transition", {})
 
     newest_tracked = max(tracked, key=ckey) if tracked else None
@@ -406,6 +410,11 @@ def plan_lines(cfg, channels, repo: Path, updater=None):
             problem = updater.conda_version_problem(info["latest_sdk"])
             if transition_cfg.get("enabled") and out_branch == "main" and not problem:
                 if git_show(repo, cut, "recipe/meta.yaml") is not None:
+                    half_applied = {
+                        "to_channel": ch,
+                        "from_channel": out_ch,
+                        "cut_branch": cut,
+                    }
                     notices.append(
                         f"{ch} is GA and would take over `main`, but branch "
                         f"`{cut}` already exists — not proposing a transition. "
@@ -458,16 +467,26 @@ def plan_lines(cfg, channels, repo: Path, updater=None):
     # transition moves it to 11.0.100 -- and the PRs would conflict. The
     # outgoing line's patches belong on its new vN branch, which the next run
     # picks up once `tracked` maps it there. Self-healing rather than ordered.
-    if transition:
-        dropped = [b for b in bumps if b["channel"] == transition["from_channel"]]
+    #
+    # `half_applied` counts too, and keying this on `transition` alone was a
+    # bug. A transition is three actions and only the first changes a ref, so
+    # between cutting vN and `tracked` naming it there is a window where no
+    # transition is proposed -- the branch already exists -- while the outgoing
+    # line is still mapped to `main`. In that window the deferral switched off
+    # and the bump went to `main`, against the open transition PR. Observed on
+    # 2026-11-15: 10.0.404 was proposed against `main` while a PR moving `main`
+    # to 11.0.100 was open on it.
+    pending = transition or half_applied
+    if pending:
+        dropped = [b for b in bumps if b["channel"] == pending["from_channel"]]
         if dropped:
-            bumps = [b for b in bumps if b["channel"] != transition["from_channel"]]
+            bumps = [b for b in bumps if b["channel"] != pending["from_channel"]]
             d = dropped[0]
             notices.append(
                 f"Deferred the {d['channel']} bump ({d['current_sdk']} → "
-                f"{d['latest_sdk']}): a transition to {transition['to_channel']} "
+                f"{d['latest_sdk']}): a transition to {pending['to_channel']} "
                 f"is pending on the same branch. It will be proposed against "
-                f"`{transition['cut_branch']}` once that branch exists and is "
+                f"`{pending['cut_branch']}` once that branch exists and is "
                 "tracked."
             )
 
