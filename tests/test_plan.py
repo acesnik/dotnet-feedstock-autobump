@@ -330,6 +330,35 @@ def test_outgoing_bump_is_deferred_during_a_transition(plan, real_config, feedst
     assert any("Deferred the 10.0 bump" in n for n in r["notices"])
 
 
+def test_outgoing_bump_is_deferred_while_the_transition_is_half_applied(
+    plan, real_config, feedstock
+):
+    """The cut branch exists but `tracked` has not caught up yet.
+
+    A transition is three actions and only the first creates a ref, so between
+    cutting vN and `tracked` naming it there is a window with no transition to
+    propose and the outgoing line still mapped to `main`. The bump must stay
+    deferred through it: otherwise it is opened against `main`, where the
+    transition PR is already waiting to replace that recipe wholesale.
+    """
+    r = plan_it(
+        plan,
+        cfg(real_config, tracked={"9.0": "main", "8.0": "v8"}),
+        [
+            channel("11.0", "active", "sts", "11.0.100"),
+            channel("9.0", "active", "sts", "9.0.316"),  # stale, cut branch v9 exists
+            channel("8.0", "maintenance", "lts", "8.0.423"),  # stale, own branch
+        ],
+        feedstock,
+    )
+    assert r["transition"] is None, "v9 exists, so none is proposed"
+    assert any("already exists" in n for n in r["notices"])
+    channels_bumped = [b["channel"] for b in r["bumps"]]
+    assert "9.0" not in channels_bumped, "outgoing bump must not go to main"
+    assert "8.0" in channels_bumped, "unrelated lines still bump"
+    assert any("Deferred the 9.0 bump" in n for n in r["notices"])
+
+
 # --------------------------------------------------------------------------
 # architecture audit
 # --------------------------------------------------------------------------
