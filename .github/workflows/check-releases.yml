@@ -409,7 +409,15 @@ jobs:
     env:
       TR: ${{ needs.plan.outputs.transition }}
     steps:
+      # Checked out with FEEDSTOCK_TOKEN, not the default credential: step 3
+      # pushes the `tracked/<line>` branch from this very checkout. The job's
+      # `gh` calls all carry the token explicitly, but `git push` uses whatever
+      # actions/checkout persisted -- which is github-actions[bot], and the
+      # workflow grants it `contents: read`. Step 3 therefore 403'd after
+      # steps 1 and 2 had already cut the branch and opened the PR.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          token: ${{ secrets.FEEDSTOCK_TOKEN }}
 
       - name: Unpack the transition
         id: tr
